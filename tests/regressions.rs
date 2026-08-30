@@ -657,3 +657,32 @@ fn invalid_utf8_input_is_discarded() {
     assert!(!pty.panicked());
     assert_eq!(pty.lines(), ["abcd"]);
 }
+
+/// Output the caller printed without a trailing newline must reach the terminal
+/// before the next prompt is drawn.
+///
+/// The editor writes to the descriptor directly, bypassing the buffer behind
+/// `std::io::stdout()`. Without an explicit flush the caller's text overtakes
+/// nothing at all — it surfaces later, interleaved with a redraw. That is what
+/// made an application's `clear` command appear to do nothing, then clear the
+/// screen at the wrong moment one command later.
+#[test]
+fn buffered_caller_output_is_flushed_before_the_prompt() {
+    let mut pty = Pty::spawn(&["--prompt=> "], 24, 80);
+    pty.type_keys(b"unflushed\r");
+
+    let output = pty.output();
+    let marker = output
+        .find("@@UNFLUSHED@@")
+        .unwrap_or_else(|| panic!("unflushed output never arrived: {output:?}"));
+
+    // The prompt drawn after it must come later in the stream, not before.
+    let prompt_after = output[marker..].find("> ");
+    assert!(
+        prompt_after.is_some(),
+        "no prompt drawn after the flushed text: {output:?}",
+    );
+
+    pty.type_keys(b"ok\r");
+    assert_eq!(pty.lines(), ["unflushed", "ok"]);
+}

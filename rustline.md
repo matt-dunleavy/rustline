@@ -11,7 +11,7 @@ different from bestline.
 
 | | Before | After |
 |---|---|---|
-| `cargo test` | did not build | 164 pass, 0 fail |
+| `cargo test` | did not build | 167 pass, 0 fail |
 | `cargo clippy -D warnings` | 1 warning | clean |
 | `cargo fmt --check` | 16 nightly-only warnings | clean |
 | `cargo doc` | no docs at all | clean, every public item documented |
@@ -20,7 +20,7 @@ different from bestline.
 | Keybindings working | 11 | 46 |
 | Version control | none | `git init`, baseline committed |
 
-Test breakdown: 119 unit and property tests in `src/`, 45 pseudoterminal
+Test breakdown: 119 unit and property tests in `src/`, 46 pseudoterminal
 integration tests in `tests/regressions.rs`, 2 doctests.
 
 ---
@@ -345,6 +345,32 @@ Every technique the review asked for is now in place.
 - **Table-driven keybinding tests** — `the_full_control_key_map_works` and
   `word_and_expression_editing` drive each binding end to end. The P0 case
   mismatch would have failed the first assertion.
+
+---
+
+## Found after implementation
+
+- [x] **An application's `clear` command appeared to do nothing, then cleared
+      the screen one command later.** Reported from a Fedora console and
+      reproduced on the pty. **[verified]**
+
+      Two layers. The examples printed the escape with `print!("\x1b[H\x1b[2J")`,
+      which has no trailing newline, so Rust's `LineWriter` left it in the
+      buffer. Underneath that, the editor writes straight to the descriptor and
+      bypasses the buffer behind `std::io::stdout()` entirely, so the prompt
+      overtook the pending text and the escape only escaped later, when some
+      `println!` happened to flush it.
+
+      This was never specific to `clear`: any caller using `print!` without a
+      newline before a prompt would have seen their output surface at the wrong
+      moment. bestline avoids it with `fflush(stdout)` in `bestlineInit` before
+      entering raw mode (`bestline.c:3845`); the port had dropped that line.
+
+      **Fixed:** `readline_raw` flushes `std::io::stdout()` before touching the
+      terminal, and a public `rustline::clear_screen()` writes the sequence
+      straight to the descriptor so applications need not think about buffering
+      at all. Both examples use it.
+      Guarded by `buffered_caller_output_is_flushed_before_the_prompt`.
 
 ---
 

@@ -24,7 +24,9 @@ fn main() {
                     "help" => print_help(),
                     "exit" | "quit" => break,
                     "history" => print_history(&rl),
-                    "clear" => print!("\x1b[H\x1b[2J"),
+                    "clear" => {
+                        let _ = rustline::clear_screen();
+                    }
                     other => println!("you typed: {other}"),
                 }
             }

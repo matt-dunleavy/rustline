@@ -197,7 +197,7 @@ fn execute(command: &str, state: &mut ReplState, rl: &mut Rustline) -> ReplResul
         }
         "bench" => run_benchmarks(state),
         "history" => show_history(rl),
-        "clear" => print!("\x1b[H\x1b[2J"),
+        "clear" => rustline::clear_screen().map_err(|e| ReplError::Command(e.to_string()))?,
         "set" => return set_variable(&parts, state),
         "get" => return get_variable(&parts, state),
         "echo" => println!("{}", state.expand_variables(&parts[1..].join(" "))),

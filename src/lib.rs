@@ -296,6 +296,13 @@ impl Rustline {
         ifd: RawFd,
         ofd: RawFd,
     ) -> Result<String> {
+        // The editor writes to the descriptor directly, bypassing the buffer
+        // behind `std::io::stdout()`. Anything the caller printed without a
+        // trailing newline is still sitting in that buffer, so flush it now or
+        // it will surface later, interleaved with a redraw. bestline does the
+        // same before entering raw mode.
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
         if !is_tty(ifd) || !is_tty(ofd) || is_unsupported_term() {
             if !prompt.is_empty() && is_tty(ofd) {
                 write_all(ofd, prompt.as_bytes())?;
@@ -327,6 +334,19 @@ impl Rustline {
 
         result
     }
+}
+
+/// Clears the terminal and moves the cursor to the top left.
+///
+/// Prefer this to printing the escape sequence yourself: it writes straight to
+/// the descriptor, so it cannot be left sitting in the buffer behind
+/// [`std::io::stdout`] the way a `print!` without a trailing newline would be.
+///
+/// This is what an application's own `clear` command should call. It is
+/// unrelated to `CTRL-L`, which the editor handles internally.
+pub fn clear_screen() -> Result<()> {
+    let ofd = std::io::stdout().as_raw_fd();
+    terminal::clear_screen(ofd)
 }
 
 /// Reads bytes from `fd` up to the next newline.

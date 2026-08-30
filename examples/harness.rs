@@ -71,6 +71,12 @@ fn main() {
             Ok(line) => {
                 println!("@@LINE@@ {line:?}");
                 rl.add_history_entry(&line);
+                // Deliberately unflushed: `print!` has no newline, so this sits
+                // in the buffer behind stdout until something flushes it. The
+                // editor must do that before it draws the next prompt.
+                if line == "unflushed" {
+                    print!("@@UNFLUSHED@@");
+                }
             }
             Err(RustlineError::Interrupted) => println!("@@INT@@"),
             Err(RustlineError::Eof) => {
