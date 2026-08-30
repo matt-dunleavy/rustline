@@ -1,100 +1,69 @@
+# Rustline is a library crate; there is no binary to install. These targets are
+# the development tasks, matching what CI runs.
 
-# Variables
-BINARY_NAME = rustline
-INSTALL_DIR = /home/matt/bin
-CARGO = cargo
-TARGET_DIR = target
-RELEASE_DIR = $(TARGET_DIR)/release
+CARGO ?= cargo
 
-# Default target
 .PHONY: all
-all: build
+all: check
 
-# Build the project in release mode
-.PHONY: build
-build:
-	@echo "Building $(BINARY_NAME) in release mode..."
-	$(CARGO) build --release
-	@cp $(RELEASE_DIR)/$(BINARY_NAME) bin/$(BINARY_NAME)
-
-# Build the project in debug mode
-.PHONY: debug
-debug:
-	@echo "Building $(BINARY_NAME) in debug mode..."
-	$(CARGO) build
-
-# Install the binary to the specified directory
-.PHONY: install
-install: build
-	@echo "Installing $(BINARY_NAME) to $(INSTALL_DIR)..."
-	@mkdir -p $(INSTALL_DIR)
-	@cp $(RELEASE_DIR)/$(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
-	@chmod +x $(INSTALL_DIR)/$(BINARY_NAME)
-	@echo "Successfully installed $(BINARY_NAME) to $(INSTALL_DIR)"
-	@echo "Make sure $(INSTALL_DIR) is in your PATH to use $(BINARY_NAME) globally"
-
-# Uninstall the binary from the specified directory
-.PHONY: uninstall
-uninstall:
-	@echo "Uninstalling $(BINARY_NAME) from $(INSTALL_DIR)..."
-	@if [ -f $(INSTALL_DIR)/$(BINARY_NAME) ]; then \
-		rm $(INSTALL_DIR)/$(BINARY_NAME); \
-		echo "Successfully uninstalled $(BINARY_NAME)"; \
-	else \
-		echo "$(BINARY_NAME) is not installed in $(INSTALL_DIR)"; \
-	fi
-
-# Clean build artifacts
-.PHONY: clean
-clean:
-	@echo "Cleaning build artifacts..."
-	$(CARGO) clean
-	rm -rf bin/$(BINARY_NAME)
-	rm -rf $(INSTALL_DIR)/$(BINARY_NAME)
-
-# Run tests
-.PHONY: test
-test:
-	@echo "Running tests..."
-	$(CARGO) test
-
-# Run the binary (debug mode)
-.PHONY: run
-run:
-	@echo "Running $(BINARY_NAME) in debug mode..."
-	$(CARGO) run
-
-# Check code without building
+## Compile the library, examples and tests without running anything.
 .PHONY: check
 check:
-	@echo "Checking code..."
-	$(CARGO) check
+	$(CARGO) check --all-targets --all-features
 
-# Format code
+## Build in release mode.
+.PHONY: build
+build:
+	$(CARGO) build --release --all-targets
+
+## Run every test, including the pseudoterminal integration suite.
+.PHONY: test
+test:
+	$(CARGO) test --all-targets --all-features
+
+## Run the demonstration REPL.
+.PHONY: run
+run:
+	$(CARGO) run --example repl
+
+## Check formatting without changing anything.
+.PHONY: fmt-check
+fmt-check:
+	$(CARGO) fmt --all -- --check
+
+## Reformat the source.
 .PHONY: fmt
-format:
-	@echo "Formatting code..."
-	$(CARGO) fmt
+fmt:
+	$(CARGO) fmt --all
 
-# Run clippy lints
+## Lint, treating warnings as errors.
 .PHONY: clippy
 clippy:
-	@echo "Running clippy..."
-	$(CARGO) clippy
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
-# Show help
+## Build the API documentation.
+.PHONY: doc
+doc:
+	$(CARGO) doc --no-deps --all-features
+
+## Audit dependencies for advisories, licences and sources.
+.PHONY: deny
+deny:
+	$(CARGO) deny check
+
+## Everything CI runs.
+.PHONY: ci
+ci: fmt-check clippy test doc
+
+## Remove build artifacts.
+.PHONY: clean
+clean:
+	$(CARGO) clean
+
+## List the available targets.
 .PHONY: help
 help:
-	@echo "Available targets:"
-	@echo "  all       - Build the project (default)"
-	@echo "  build     - Build the project in release mode"
-	@echo "  debug     - Build the project in debug mode"
-	@echo "  install   - Build and install binary to $(INSTALL_DIR)"
-	@echo "  uninstall - Remove binary from $(INSTALL_DIR)"
-	@echo "  clean     - Clean build artifacts"
-	@echo "  test      - Run tests"
-	@echo "  run       - Run the binary in debug mode"
-	@echo "  check     - Check code without building"
-	@echo "  format    - Format code with rustfmt"
-	@echo "  clippy    - Run clippy lints"
-	@echo "  help      - Show this help message"
+	@awk '/^## /{ doc = substr($$0, 4); next } \
+	      /^[a-z][a-z-]*:/ && doc { \
+	          split($$1, t, ":"); printf "  make %-12s %s\n", t[1], doc; doc = "" \
+	      }' $(MAKEFILE_LIST)

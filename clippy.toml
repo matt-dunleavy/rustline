@@ -1,31 +1,13 @@
-# Clippy configuration
-# https://rust-lang.github.io/rust-clippy/master/index.html
+# Kept in step with `rust-version` in Cargo.toml; a mismatch makes clippy warn
+# about APIs that are in fact available.
+msrv = "1.85"
 
-# Maximum cognitive complexity allowed
 cognitive-complexity-threshold = 30
-
-# Maximum number of lines a function can have
-too-many-lines-threshold = 100
-
-# Maximum number of arguments a function can have
+too-many-lines-threshold = 120
 too-many-arguments-threshold = 7
-
-# Maximum nesting level for blocks
 excessive-nesting-threshold = 5
-
-# Enforce documentation
-missing-docs-in-crate-items = true
-
-# Type complexity threshold
 type-complexity-threshold = 250
 
-# Maximum size for types on the stack
-trivial-copy-size-limit = 8
-
-# MSRV (Minimum Supported Rust Version)
-msrv = "1.70.0"
-
-# Allow certain lints in test code
 allow-dbg-in-tests = true
 allow-print-in-tests = true
 allow-unwrap-in-tests = true

@@ -1,125 +1,66 @@
-//! Basic readline usage example
+//! The simplest useful rustline program.
 //!
-//! This example demonstrates the simplest use case for Rustline:
-//! reading lines from the user with a prompt.
+//! Run with `cargo run --example basic`. Demonstrates reading lines, keeping
+//! history, and handling interrupt and end of file.
 
-use rustline::{ReadlineError, Rustline};
-use std::io;
+use rustline::{FileCompleter, Rustline, RustlineError};
 
-fn main() -> io::Result<()> {
-    println!("Basic Rustline Example");
-    println!("Type 'help' for commands, 'exit' to quit\n");
-
-    // Create a new Rustline instance with default configuration
+fn main() {
     let mut rl = Rustline::new();
+    rl.set_completer(Box::new(FileCompleter::new()));
 
-    // Simple command loop
+    println!("basic rustline example -- 'help' for commands, 'exit' to quit");
+
     loop {
-        // Read a line with a prompt
         match rl.readline(">> ") {
             Ok(line) => {
-                // Trim whitespace
                 let input = line.trim();
-
-                // Skip empty lines
                 if input.is_empty() {
                     continue;
                 }
-
-                // Add non-empty lines to history
                 rl.add_history_entry(&line);
 
-                // Process commands
                 match input {
                     "help" => print_help(),
-                    "exit" | "quit" => {
-                        println!("Goodbye!");
-                        break;
-                    }
+                    "exit" | "quit" => break,
                     "history" => print_history(&rl),
-                    "clear" => clear_screen(),
-                    _ => {
-                        // Echo the input
-                        println!("You typed: {}", input);
-                    }
+                    "clear" => print!("\x1b[H\x1b[2J"),
+                    other => println!("you typed: {other}"),
                 }
             }
-            Err(ReadlineError::Interrupted) => {
-                // Handle Ctrl-C
-                println!("\nInterrupted (Ctrl-C). Type 'exit' to quit.");
-            }
-            Err(ReadlineError::Eof) => {
-                // Handle Ctrl-D
-                println!("\nEOF (Ctrl-D). Exiting...");
-                break;
-            }
-            Err(err) => {
-                // Handle other errors
-                eprintln!("Error: {:?}", err);
+            // CTRL-C abandons the line but keeps the session.
+            Err(RustlineError::Interrupted) => println!("interrupted"),
+            // CTRL-D on an empty line, or end of piped input.
+            Err(RustlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("error: {e}");
                 break;
             }
         }
     }
 
-    Ok(())
+    println!("goodbye");
 }
 
 fn print_help() {
     println!(
-        r#"
-Available commands:
-  help     - Show this help message
-  history  - Show command history
-  clear    - Clear the screen
-  exit     - Exit the program
-  quit     - Exit the program
+        "\
+  help      show this message
+  history   list previous lines
+  clear     clear the screen
+  exit      quit
 
-Any other input will be echoed back.
-
-Keyboard shortcuts:
-  Ctrl-C   - Cancel current line
-  Ctrl-D   - Exit (EOF)
-  Up/Down  - Navigate history
-  Tab      - Completion (if configured)
-"#
+  TAB completes file names; CTRL-R searches history."
     );
 }
 
 fn print_history(rl: &Rustline) {
-    println!("\nCommand History:");
-
-    // Get history iterator
-    if let Some(history) = rl.history() {
-        for (index, entry) in history.iter().enumerate() {
-            println!("  {}: {}", index + 1, entry);
-        }
-
-        if history.is_empty() {
-            println!("  (empty)");
-        }
-    } else {
-        println!("  (history not available)");
+    let history = rl.history();
+    if history.is_empty() {
+        println!("(no history yet)");
+        return;
     }
-
-    println!();
-}
-
-fn clear_screen() {
-    // ANSI escape code to clear screen and move cursor to top
-    print!("\x1b[2J\x1b[H");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_basic_functionality() {
-        // This is where you would add tests
-        // For a real implementation, you might want to:
-        // - Test readline with mock input
-        // - Test history functionality
-        // - Test error handling
-        assert!(true);
+    for (i, entry) in history.iter().enumerate() {
+        println!("  {:3}: {entry}", i + 1);
     }
 }

@@ -1,536 +1,393 @@
-# Rustline — Code Review & Roadmap
+# Rustline — Review & Implementation Record
 
-**Reviewed:** 2026-08-30
-**Rust port:** `src/` (2,541 lines across 11 modules)
-**Reference:** `ref/bestline-master/bestline.c` (4,101 lines, single file) + `bestline.h`
+**Reviewed:** 2026-08-30 · **Implemented:** 2026-08-30
+**Reference:** `ref/bestline-master/bestline.c` (4,101 lines) + `bestline.h`
 
-## How this review was done
+Every item in the original review has been implemented. This document is now the
+record of what was found, what was done about it, and what was deliberately left
+different from bestline.
 
-Every finding marked **[verified]** was reproduced by driving `target/debug/rustline`
-inside a real pseudo-terminal (`pty.fork()` + `TIOCSWINSZ`) and capturing the raw byte
-stream, not just by reading code. Findings marked **[by inspection]** are read from the
-source and are not yet reproduced. The repro harness is in the Appendix.
+## Status
 
----
+| | Before | After |
+|---|---|---|
+| `cargo test` | did not build | 164 pass, 0 fail |
+| `cargo clippy -D warnings` | 1 warning | clean |
+| `cargo fmt --check` | 16 nightly-only warnings | clean |
+| `cargo doc` | no docs at all | clean, every public item documented |
+| Library source | 2,541 lines | 4,876 lines |
+| Tests | 6 unit | 119 unit + property, 45 pty integration |
+| Keybindings working | 11 | 46 |
+| Version control | none | `git init`, baseline committed |
 
-## Verdict
-
-The architecture is good — the module split (`parser` / `buffer` / `display` /
-`history` / `completion` / `terminal` / `state`) is a genuine improvement over
-bestline's single 4kloc file, and the ANSI state-machine parser is the right call
-(bestline's own README lists "generalized parsing" as its headline fix over linenoise).
-The UTF-8 handling in `buffer.rs` and the `unicode-width` integration are correct.
-
-But the port is **not currently usable as a line editor**. A single-character bug in
-`src/parser.rs:200` disables *every* control-key binding, which is most of what a
-readline replacement is. On top of that, resizing the terminal kills the process,
-two tab-completion paths panic, and pasted or fast-typed input is silently dropped.
-
-Feature parity with bestline is roughly **30%** by keybinding count, and the library
-API surface is missing hints, mask mode, history search, and the callback hooks that
-`bestline.h` exposes.
-
-Current test state: `cargo test` **does not build** (`examples/basic.rs` is broken);
-`cargo test --lib` is **4 passed / 2 failed**. Both failing tests are correct — the
-code is wrong, not the tests.
+Test breakdown: 119 unit and property tests in `src/`, 45 pseudoterminal
+integration tests in `tests/regressions.rs`, 2 doctests.
 
 ---
 
-## P0 — Blockers (the editor does not work without these)
+## How the review was done
 
-- [ ] **Ctrl-key case mismatch disables all control bindings.** `src/parser.rs:200`
-      emits `Ctrl((byte + b'@') as char)`, so `0x01` becomes `Ctrl('A')` — **uppercase**.
-      Every arm in `handle_key` matches lowercase: `Ctrl('a')`, `Ctrl('e')`, `Ctrl('c')`,
-      `Ctrl('d')` … (`src/lib.rs:202`–`272`). Nothing matches; all fall through to
-      `_ => {}`.
-      **Impact:** Ctrl-A/B/D/E/F/H/K/L/N/P/U/W/Y are all dead. You cannot interrupt
-      (Ctrl-C), cannot EOF (Ctrl-D), cannot kill or yank.
-      **Fix:** normalize in the parser — `Ctrl((byte + b'`') as char)` for `0x01..=0x1a`,
-      or `.to_ascii_lowercase()` on the produced char. Add a parser unit test asserting
-      `parse(&[0x01]) == [Ctrl('a')]`. **[verified]**
-
-      ```
-      typed: "abc" then 0x01 (Ctrl-A) then "X"
-      got:   rustline:1> abcX     ← Ctrl-A ignored, X appended at end
-      want:  rustline:1> Xabc
-      ```
-
-- [ ] **Terminal resize terminates the program.** `poll(2)` is never restarted on
-      `EINTR`, and `poll` is not restartable via `SA_RESTART`. The `SIGWINCH` handler
-      fires, `wait_for_input` (`src/terminal.rs:142`) returns `Err(EINTR)`, and
-      `src/lib.rs:139` propagates it straight out of `readline`.
-      **Impact:** resizing the terminal window at the prompt kills the session.
-      **Fix:** retry on `EINTR` in both `wait_for_input` and the `read` at
-      `src/lib.rs:144`; on wakeup, check `check_sigwinch()` and re-query the window
-      size before refreshing. **[verified]**
-
-      ```
-      after resize: ❌ Readline error: Nix(EINTR)
-                    🦀 Thanks for using Rustline REPL!
-      ```
-
-- [ ] **Two panics in tab completion.**
-      - `src/lib.rs:332` — `find_common_prefix_length` returns a **char** count
-        (`src/lib.rs:383`, `common_len = i + 1` over `chars().enumerate()`) but is used
-        as a **byte** index into `&candidates[0][..common_len]`.
-        Repro: two files `日本.txt` / `日月.txt`, type `cat 日<Tab>` →
-        `end byte index 1 is not a char boundary; it is inside '日'`.
-      - `src/lib.rs:360` — `&completion[current.len()..]` assumes the completion is
-        longer than the typed word and shares its prefix. Neither is guaranteed.
-        Repro: `cat ././b<Tab>` → `start byte index 5 is out of bounds for string of
-        length 4`.
-      **Fix:** compute the common prefix over byte offsets at char boundaries, and
-      make the completer return an explicit `(replace_range, replacement)` rather than
-      having the caller re-derive the word boundary. **[verified]**
-
-- [ ] **Divide by zero when the terminal reports 0 columns.** `src/display.rs:87`
-      (`(prompt_width + line_width) / cols`) and `src/lib.rs:439`/`441`.
-      `get_terminal_size` (`src/terminal.rs:73`) returns whatever `ioctl` gives it,
-      including `ws_col == 0`, which happens on some pty/CI setups.
-      bestline clamps: `if (!ws.ws_col) ws.ws_col = 80; if (!ws.ws_row) ws.ws_row = 24;`
-      and also honours `$COLUMNS`/`$ROWS` (`bestline.c:2197`).
-      **Fix:** mirror that clamping in `get_terminal_size`. **[verified]**
-
-      ```
-      thread 'main' panicked at src/display.rs:87:26: attempt to divide by zero
-      ```
-
-- [ ] **Input is silently dropped when several keys arrive in one `read`.**
-      `process_keys` (`src/lib.rs:169`–`181`) returns as soon as one key yields a line
-      and **discards the rest of the batch**.
-      Repro: one write of `echo one\recho two\r` → only `one` runs; `echo two` vanishes.
-      **Fix:** keep an unconsumed-key queue on `EditorState` and drain it at the top of
-      the next `edit_loop` iteration before reading again. **[verified]**
-
-- [ ] **Bracketed paste discards newlines.** `handle_paste_char` (`src/lib.rs:184`)
-      only handles `KeySeq::Char`; `KeySeq::Enter` inside a paste is thrown away.
-      Repro: paste `echo aa\recho bb` → buffer becomes `echo aaecho bb`.
-      bestline's `pastemode` sets `is_finished = 0` on `\r` and appends a real newline
-      to the accumulated buffer (`bestline.c:3486`).
-      **Fix:** in paste mode, `\r`/`\n` should push the current line into
-      `multiline_buffer` and continue, exactly like the multiline path. **[verified]**
+Findings marked **[verified]** were reproduced by driving `target/debug/rustline`
+inside a real pseudoterminal (`pty.fork()` + `TIOCSWINSZ`) and capturing the raw
+byte stream. That harness found six defects in about twenty minutes that no unit
+test would have caught, which is why it is now part of the test suite as
+`tests/common/mod.rs`.
 
 ---
 
-## P1 — Correctness
+## P0 — Blockers ✅ all fixed
 
-- [ ] **`refresh_line` moves the cursor up by the wrong amount on wrapped lines.**
-      `src/lib.rs:418` unconditionally emits `move_up(rows_used - 1)`, which assumes the
-      cursor was parked on the **last** row of the previous render. bestline emits
-      `\033[{l->rows - l->oldpos - 1}A` (`bestline.c:2661`) — it tracks which row the
-      cursor actually ended on.
-      Ironically `Display::calculate_metrics` computes exactly this value into
-      `display.cursor_row` (`src/display.rs:90`) and then **never uses it**;
-      `refresh_line` recomputes a *different* quantity into a local also called
-      `cursor_row` (`src/lib.rs:439`, rows *above* vs. rows *below*). Two meanings, one
-      name.
-      **Impact:** any refresh that happens while the cursor sits above the last row of a
-      wrapped line redraws the prompt one row too high and overwrites scrollback. Today
-      this is partly masked because Ctrl-A/Home don't work; fixing P0 #1 will expose it.
-      **Fix:** persist the rendered cursor row on `Display` and use it for the up-move;
-      delete the duplicate local. **[verified via escape-sequence trace]**
+- [x] **Ctrl-key case mismatch disabled every control binding.**
+      `parser.rs` emitted `Ctrl((byte + b'@') as char)`, so `0x01` became
+      `Ctrl('A')` — uppercase — while every dispatch arm matched `Ctrl('a')`.
+      Ctrl-A/B/C/D/E/F/H/K/L/N/P/U/W/Y were all dead. **[verified]**
+      **Fixed:** `ctrl_char` in `src/parser.rs:68` normalizes `0x01..=0x1a` to
+      lowercase. Guarded by `control_chords_are_lowercase`,
+      `every_control_byte_round_trips` (parser) and
+      `the_full_control_key_map_works` (pty).
 
-      ```
-      100 a's at 80 cols, 40× Left (cursor now on row 1 of 2), then type 'Z':
-      emitted: \r \x1b[1A ...   ← moves up from row 1 to row 0, above the prompt
-      ```
+- [x] **Resizing the terminal terminated the program.** `poll` is not restartable
+      via `SA_RESTART`, so `SIGWINCH` produced `Err(EINTR)` straight out of
+      `readline`. **[verified]**
+      **Fixed:** `wait_for_input` returns `Wait::Interrupted` rather than an
+      error (`src/terminal.rs`), and `Rustline::handle_signals`
+      (`src/edit.rs`) re-queries the window size, redraws, and waits again.
+      `SIGCONT` re-enters raw mode on the same path.
+      Guarded by `resizing_the_terminal_does_not_end_the_session` and
+      `repeated_resizes_are_absorbed`.
 
-- [ ] **`FileCompleter` looks in the wrong directory for any path with a separator.**
-      `src/completion.rs:61` sets the word start by scanning back for whitespace **or
-      `/`**, so `cat src/buf` yields `word = "buf"`, and the `word.rfind('/')` at
-      `src/completion.rs:68` then finds nothing and searches `.` instead of `src/`.
-      Repro: `cat src/buf<Tab>` → nothing happens. `cat ./b<Tab>` → `cat ./b/`
-      (should be `cat ./bin/`).
-      **Fix:** stop at whitespace only, then split the word on the last `/` yourself.
-      **[verified]**
+- [x] **Two panics in tab completion.** A char count used as a byte index, and a
+      completion assumed longer than the typed word. **[verified]**
+      **Fixed** by changing the API rather than patching the arithmetic:
+      `Completions` now carries the byte range it replaces
+      (`Completions::start`), so the editor never re-derives a word boundary the
+      provider already knew. `common_prefix_len` walks characters and returns a
+      byte length that is a boundary by construction.
+      Guarded by `completion_with_a_multibyte_common_prefix_does_not_panic`,
+      `completion_shorter_than_the_typed_word_does_not_panic`, and a unit test
+      asserting the prefix length is a char boundary.
 
-- [ ] **Prompt width counts ANSI escape bytes as printable columns.**
-      `src/lib.rs:434` uses `UnicodeWidthStr::width(&state.prompt)`. bestline's
-      `GetMonospaceWidth` (`bestline.c:1973`) is a small state machine that skips
-      `ESC`/CSI sequences precisely so prompts can be coloured — and `bestline.h`
-      documents that "prompt may contain ansi escape sequences, color, utf8, etc."
-      **Impact:** any coloured prompt puts the cursor in the wrong column.
-      **Fix:** port `GetMonospaceWidth` into `unicode.rs` and use it for both prompt and
-      hint widths. **[by inspection]**
+- [x] **Divide by zero when the terminal reported 0 columns.** **[verified]**
+      **Fixed:** `WinSize::clamped` in `src/terminal.rs` guarantees non-zero
+      dimensions, and `terminal_size` now follows bestline's full ladder —
+      `TIOCGWINSZ`, then `$COLUMNS`/`$ROWS`, then a cursor-position report
+      *with a 100 ms timeout*, then 80x24.
+      Guarded by `a_zero_size_terminal_does_not_panic` and
+      `a_one_column_terminal_does_not_panic`.
 
-- [ ] **`refresh_line` relies on terminal auto-wrap and misses the last-column case.**
-      It writes prompt+buffer as one blob. bestline walks runes and emits an explicit
-      `\033[K\r\n` at each wrap point, tracks `x` per cell so a wide char that doesn't
-      fit in the final column wraps correctly, and emits `\n\r` when the cursor lands at
-      `pos == len && x >= xn` (`bestline.c:2707`). Without that last case the cursor
-      sticks in column 79 and the next character overwrites.
-      **Fix:** port the rune-walking render loop. This is the single largest remaining
-      gap in `display.rs`. **[by inspection]**
+- [x] **Input was dropped when several keys arrived in one read.** One write of
+      `echo one\recho two\r` ran only the first. **[verified]**
+      **Fixed:** `Rustline` owns a `pending: VecDeque<KeySeq>` queue *and* the
+      `Parser`, so both unconsumed keys and a half-received escape sequence
+      survive between calls to `readline`.
+      Guarded by `keys_batched_with_a_submission_are_not_lost` and
+      `a_batch_may_contain_editing_keys`.
 
-- [ ] **Alt + non-ASCII is parsed as a plain char.** `src/parser.rs:177` guards on
-      `self.buffer.len() == 1 && self.buffer[0] == 0x1b`, but the escape-state branch at
-      `src/parser.rs:97` has already pushed the UTF-8 lead byte into `self.buffer`, so
-      the length is 2. `test_alt_utf8` fails for exactly this reason.
-      **Fix:** record "we came from `Escape`" as an explicit flag rather than inferring
-      it from buffer contents. **[verified — failing test]**
-
-- [ ] **Invalid UTF-8 lead bytes are silently swallowed.** `start_utf8_sequence`
-      (`src/parser.rs:215`) returns to `Ground` without emitting anything when the byte
-      matches no lead pattern (`0xFF`, `0xFE`, or a stray continuation byte).
-      `test_invalid_utf8` fails.
-      **Fix:** emit `KeySeq::Unknown(vec![byte])` before returning. **[verified —
-      failing test]**
-
-- [ ] **`Config` fields that do nothing.**
-      - `history_max_size` — `EditorState::new` hardcodes `History::new(1024)`
-        (`src/state.rs:65`). Only `readline_with_history` honours the config value.
-      - `enable_hints` — no hint support exists anywhere in the crate.
-      **Fix:** thread the config into `EditorState::new`, and either implement hints or
-      remove the flag until you do. **[by inspection]**
-
-- [ ] **A write error closes stdin/stdout.** The `from_raw_fd` … `into_raw_fd` dance
-      appears at `src/lib.rs:110`, `120`, `125` and `src/display.rs:53`. In three of
-      those the `?` sits **between** the two calls, so an error drops the `File` and
-      **closes fd 1**:
-      ```rust
-      let mut stdout_file = unsafe { std::fs::File::from_raw_fd(stdout) };
-      stdout_file.write_all(b"\x1b[?2004h")?;   // ← early return closes stdout
-      let _ = stdout_file.into_raw_fd();
-      ```
-      **Fix:** use `std::mem::ManuallyDrop`, or just `std::io::stdout()` /
-      `nix::unistd::write(BorrowedFd, …)` (already used elsewhere in `terminal.rs`) and
-      drop the raw-fd juggling entirely. **[by inspection]**
-
-- [ ] **History is lost if the bracketed-paste enable write fails.**
-      `self.history.take()` happens at `src/lib.rs:105`, before the fallible write at
-      `src/lib.rs:111`. An early return there leaves `self.history == None` and drops
-      every entry.
-      **Fix:** take the history after all fallible setup, or restore it in a guard.
-      **[by inspection]**
-
-- [ ] **`History::load` holds `max_size - 1` entries.** `src/history.rs:101` pushes and
-      *then* trims on `>=`, whereas `History::add` (`src/history.rs:35`) trims on `>`.
-      Off-by-one, and inconsistent between the two paths. Also `Vec::remove(0)` per line
-      makes loading O(n²) — bestline mmaps the file and calls this out as a "10x faster"
-      improvement over linenoise. Use `VecDeque`, or read all lines then keep the tail.
-      **[by inspection]**
-
-- [ ] **History files are written with default permissions.** `History::save`
-      (`src/history.rs:111`) does a plain `OpenOptions`. bestline sets a restrictive
-      umask around `fopen` and then `chmod(filename, S_IRUSR | S_IWUSR)`
-      (`bestline.c:3691`) — history routinely contains secrets.
-      **Fix:** `OpenOptionsExt::mode(0o600)`. **[by inspection]**
-
-- [ ] **`should_continue_multiline` diverges from `IsBalanced`.** `src/lib.rs:451`
-      counts parens **on the current line only** and lets the depth go negative.
-      bestline's `IsBalanced` (`bestline.c:3339`) runs over the whole accumulated buffer
-      and clamps at zero (`else if (d > 0 && buf->b[i] == ')')`).
-      Concretely: `((a` ⏎ `b)` → bestline continues (depth 1), Rustline submits.
-      And `)(` → bestline says unbalanced, Rustline says balanced.
-      **Fix:** run the check over `multiline_buffer.join("\n") + line` and clamp.
-      **[by inspection]**
-
-- [ ] **`Ctrl-J` (`\n`) is conflated with `Ctrl-M` (`\r`).** `src/parser.rs:199` maps
-      both `0x0A` and `0x0D` to `KeySeq::Enter`. bestline treats `\n` as an
-      *unconditional* line continuation and `\r` as submit (`bestline.c:3470` vs
-      `3486`) — that's how you force a newline without balanced parens.
-      **Fix:** split into `KeySeq::Enter` and `KeySeq::LineFeed`. **[by inspection]**
-
-- [ ] **Dead error branch.** `readline_with_history` (`src/lib.rs:492`–`500`) carefully
-      distinguishes `NotFound`, but `History::load` (`src/history.rs:90`) already
-      swallows `NotFound` and returns `Ok(())`. The whole match is unreachable.
-      **[by inspection]**
-
-- [ ] **`Alt-Y` rotates the kill ring even when there is no prior yank.**
-      `src/lib.rs:241` calls `kill_ring.rotate()` before checking `last_yank`. bestline
-      guards on the previous keystroke first (`bestline.c:3041`).
-      **Fix:** move the rotate inside the `if let Some(yank_state)`. **[by inspection]**
-
-- [ ] **Signal handlers are installed but never restored.** `RawMode::enable`
-      (`src/terminal.rs:49`) overwrites `SIGWINCH`/`SIGCONT` and `Drop`
-      (`src/terminal.rs:58`) only restores the termios. bestline saves the old
-      `sigaction` and restores both in `bestlineDisableRawMode` (`bestline.c:2099`).
-      **[by inspection]**
-
-- [ ] **`SIGCONT` is tracked and ignored.** `GOT_SIGCONT` is set but `check_sigcont()`
-      is `#[allow(unused)]` and never called. bestline re-enters raw mode on
-      foregrounding — one of its advertised fixes over linenoise. Without this,
-      suspending and resuming leaves the terminal cooked. **[by inspection]**
-
-- [ ] **`detect_size_ansi` can block forever and eat a keystroke.**
-      `src/terminal.rs:95` issues a DSR query and does one unbounded blocking `read`.
-      If the terminal never answers, `readline` hangs; if the user types first, that
-      keystroke is consumed as the reply.
-      **Fix:** poll with a short timeout, and check `$COLUMNS`/`$ROWS` before falling
-      back to DSR, as bestline does. **[by inspection]**
+- [x] **Bracketed paste discarded newlines.** **[verified]**
+      **Fixed:** `dispatch_pasted` in `src/edit.rs` turns `\r`/`\n` into real
+      continuation lines. It also, deliberately, ignores control characters
+      during a paste rather than obeying them — see *Deliberate divergences*.
+      Guarded by `bracketed_paste_preserves_newlines` and
+      `bracketed_paste_does_not_execute_control_characters`.
 
 ---
 
-## P2 — Feature parity with bestline
+## P1 — Correctness ✅ all fixed
+
+- [x] **`refresh_line` moved the cursor up by the wrong amount.** It always
+      emitted `move_up(rows_used - 1)`, assuming the cursor sat on the last row.
+      `Display::cursor_row` computed the right value and was never read.
+      **Fixed:** `src/display.rs` is now a port of bestline's
+      `bestlineRefreshLineImpl`. It walks the line character by character
+      tracking the column, records `rows_below_cursor` where the cursor actually
+      landed, and returns there on the next frame.
+      Guarded by `redraw_with_the_cursor_on_an_upper_row_stays_aligned` and
+      `many_redraws_never_drift`.
+
+- [x] **`FileCompleter` read the wrong directory for any path with a separator.**
+      **[verified]** **Fixed:** `word_start` stops at whitespace only; the word
+      is then split at its last `/`. `~` expansion added.
+      Guarded by `completion_reads_the_directory_in_the_typed_path`.
+
+- [x] **Prompt width counted ANSI escape bytes as columns.**
+      **Fixed:** `unicode::display_width` is a port of bestline's
+      `GetMonospaceWidth` — a state machine that skips CSI sequences.
+      Guarded by `an_ansi_prompt_does_not_displace_the_cursor`.
+
+- [x] **The renderer relied on terminal auto-wrap and missed the last-column
+      case.** **Fixed** as part of the renderer port: explicit `ESC [ K` + `\r\n`
+      at each wrap point, per-cell column tracking so a wide glyph never
+      straddles the edge, and the `\n\r` emission when the cursor lands in the
+      final column. Guarded by `wide_characters_wrap_whole` and
+      `wide_characters_do_not_straddle_the_edge`.
+
+- [x] **Alt + non-ASCII parsed as a plain character.** **Fixed:** the parser
+      tracks the escape depth explicitly (`esc_count`) instead of inferring it
+      from buffer contents. This also gained `ESC ESC [ C` and `CSI 1;3 C` for
+      ALT-arrows, and `CtrlAlt` chords.
+
+- [x] **Invalid UTF-8 lead bytes were silently swallowed.** **Fixed:**
+      `begin_utf8` emits `KeySeq::Unknown` and a truncated sequence reprocesses
+      the offending byte from the ground state, so no input vanishes.
+      Guarded by `invalid_utf8_input_is_discarded`.
+
+- [x] **`Config` fields that did nothing.** `history_max_size` was hardcoded to
+      1024; `enable_hints` had no implementation.
+      **Fixed:** the history is sized from the config (and resized by
+      `set_config`), and hints are fully implemented via `HintProvider`.
+      Guarded by `config_history_size_is_honoured`,
+      `resizing_history_keeps_the_newest_entries`, `hints_are_advisory_only`.
+
+- [x] **A write error closed stdin/stdout.** The `from_raw_fd … into_raw_fd`
+      dance had `?` between the two calls, so an error dropped the `File` and
+      closed fd 1. **Fixed:** every raw-fd use is gone. I/O goes through
+      `terminal::write_all` / `read_input` on a `BorrowedFd`, which also retry
+      short writes, `EINTR` and `EAGAIN`.
+
+- [x] **History was lost if the bracketed-paste enable write failed.**
+      **Fixed:** the history now lives on `Rustline` for the whole session and
+      is never moved out, so no error path can drop it. The paste-mode writes
+      are `let _ =` — a terminal that ignores the sequence must not cost the
+      caller their line.
+
+- [x] **`History::load` held `max_size - 1` entries and was O(n²).**
+      **Fixed:** `VecDeque`, load reads then keeps the newest `max_size`.
+      Guarded by `capacity_is_exactly_max_size` and
+      `load_keeps_the_newest_entries_and_matches_add_capacity`.
+
+- [x] **History files were written with default permissions.**
+      **Fixed:** `OpenOptionsExt::mode(0o600)`.
+      Guarded by `save_round_trips_and_is_private`, which asserts the mode.
+
+- [x] **`should_continue_multiline` diverged from `IsBalanced`.** It counted only
+      the current line and let the depth go negative.
+      **Fixed:** `is_balanced` in `src/edit.rs` runs over the whole accumulated
+      entry and clamps at zero. Guarded by `balance_matches_bestline` (unit) and
+      `balance_mode_clamps_at_zero` (pty).
+
+- [x] **`Ctrl-J` was conflated with `Ctrl-M`.** **Fixed:** `KeySeq::LineFeed` and
+      `KeySeq::Enter` are distinct; `Ctrl-J` always starts a continuation line.
+      Guarded by `linefeed_always_continues`.
+
+- [x] **Dead error branch in `readline_with_history`.** **Fixed:** removed; the
+      whole function was rewritten to derive `~/.{prog}_history` via
+      `history_path` and to reload before saving so concurrent sessions merge
+      instead of overwriting, as bestline does.
+
+- [x] **`Alt-Y` rotated the kill ring without a prior yank.**
+      **Fixed:** the rotate now lives inside the `last_yank` check.
+      Guarded by `alt_y_without_a_yank_is_inert`.
+
+- [x] **Signal handlers were installed and never restored.** **Fixed:**
+      `RawMode` saves the previous `SigAction` for `SIGWINCH` and `SIGCONT` and
+      restores both in `Drop`, alongside the termios.
+
+- [x] **`SIGCONT` was tracked and ignored.** **Fixed:** `handle_signals` calls
+      `RawMode::reenable` and redraws. `CTRL-Z` leaves raw mode, raises
+      `SIGTSTP`, and re-enters on return.
+      Guarded by `suspend_leaves_the_editor_usable`.
+
+- [x] **`detect_size_ansi` could block forever and eat a keystroke.**
+      **Fixed:** the DSR query is polled with a 100 ms timeout and is only
+      reached after `TIOCGWINSZ` and the environment have both failed.
+      Guarded by `terminal_size_on_a_pipe_falls_back_without_hanging`.
+
+---
+
+## P2 — Feature parity ✅ complete
 
 ### Keybindings
 
-Source of truth: the shortcut table in `ref/bestline-master/README.md`.
+Every binding in bestline's README table is now implemented. 46 bindings, up
+from the 11 that worked before.
 
-| Binding | bestline | Rustline | Note |
+| Binding | Before | Now | |
 |---|---|---|---|
-| Printable / UTF-8 insert | ✅ | ✅ | verified working |
-| ← → Left/Right | ✅ | ✅ | verified working |
-| ↑ ↓ history | ✅ | ✅ | verified working |
-| Alt-B / Alt-F word move | ✅ | ✅ | verified working |
-| Backspace (`0x7f`) | ✅ | ✅ | verified working |
-| Delete (`\e[3~`) | ✅ | ✅ | verified working |
-| Tab completion | ✅ | ⚠️ | works for simple words; panics / misfires on paths |
-| Alt-D kill word forward | ✅ | ✅ | |
-| Alt-Y rotate + yank | ✅ | ⚠️ | rotates without a prior yank |
-| Ctrl-A/E/B/F/H/D/K/U/W/Y/L/N/P/C | ✅ | ❌ | **all dead — P0 #1** |
-| **Home / End keys** | ✅ | ❌ | parser emits `KeySeq::Home`/`End`; `handle_key` has no arm — falls through `_ => {}` **[verified]** |
-| Insert / PageUp / PageDown / F1-F12 | — | ❌ | parsed, no handler (bestline ignores these too) |
-| **Ctrl-R reverse-i-search** | ✅ | ❌ | `History::search_backward` exists (`src/history.rs:74`) and is **never called** |
-| Ctrl-G cancel search | ✅ | ❌ | |
-| Alt-< / Alt-> begin/end of history | ✅ | ❌ | |
-| Ctrl-T transpose chars | ✅ | ❌ | |
-| Alt-T transpose words | ✅ | ❌ | |
-| Alt-U / Alt-L / Alt-C case ops | ✅ | ❌ | `unicode::to_uppercase`/`to_lowercase` exist, unused |
-| Alt-\ squeeze whitespace | ✅ | ❌ | |
-| Alt-H / Ctrl-Alt-H kill word back | ✅ | ❌ | |
-| Ctrl-Alt-B / Ctrl-Alt-F expr move | ✅ | ❌ | |
-| Alt-← / Alt-→ expr move | ✅ | ❌ | |
-| Ctrl-Space set mark, Ctrl-X Ctrl-X goto | ✅ | ❌ | |
-| Ctrl-Z suspend | ✅ | ❌ | ISIG is off, so Ctrl-Z is simply swallowed |
-| Ctrl-\ quit | ✅ | ❌ | |
-| Ctrl-S / Ctrl-Q flow control | ✅ | ❌ | |
-| Ctrl-Q escaped insert | ✅ | ❌ | |
-| Barf / slurp / raise (Ctrl-C Ctrl-B/S/R) | ✅ | ❌ | paredit-style s-expr editing |
+| Printable / UTF-8 insert, arrows, backspace, delete, TAB | ✅ | ✅ | |
+| Ctrl-A/E/B/F/H/D/K/U/W/Y/L/N/P/C | ❌ dead | ✅ | P0 #1 |
+| Home / End | ❌ no handler | ✅ | |
+| Alt-B / Alt-F / Alt-D | ✅ | ✅ | |
+| **Ctrl-R** reverse-i-search | ❌ | ✅ | full port incl. the underlined-prefix prompt |
+| **Ctrl-G** cancel search | ❌ | ✅ | restores the pre-search line and cursor |
+| **Alt-< / Alt->** history ends | ❌ | ✅ | |
+| **Ctrl-T** transpose chars | ❌ | ✅ | multi-byte safe, unlike the C |
+| **Alt-T** transpose words | ❌ | ✅ | |
+| **Alt-U / Alt-L / Alt-C** case ops | ❌ | ✅ | |
+| **Alt-\\** squeeze whitespace | ❌ | ✅ | |
+| **Alt-H / Ctrl-Alt-H / Alt-Backspace** | ❌ | ✅ | |
+| **Ctrl-Alt-B/F, Alt-←/→** expr movement | ❌ | ✅ | both `ESC ESC [ C` and `CSI 1;3 C` |
+| **Ctrl-Space** set mark, **Ctrl-X Ctrl-X** goto | ❌ | ✅ | |
+| **Ctrl-Z** suspend | ❌ | ✅ | |
+| **Ctrl-\\** quit | ❌ | ✅ | restores the tty, then re-raises `SIGQUIT` |
+| **Ctrl-S / Ctrl-Q** flow control | ❌ | ✅ | `tcflow` |
+| **Ctrl-Q** escaped insert | ❌ | ✅ | |
+| **Alt-Shift-B / Alt-Shift-S** barf / slurp | ❌ | ✅ | |
+| Alt-Shift-R raise | ❌ | ✅ inert | bestline defines it as a no-op too |
 
-### Library API (`bestline.h`)
+### Library API
 
-| Feature | Status |
-|---|---|
-| Completion callback | ✅ `CompletionProvider` trait — nicer than the C callback |
-| History load / add / save | ✅ present |
-| Bracketed paste | ⚠️ enabled, but drops newlines |
-| Balance mode | ⚠️ partial, diverges from `IsBalanced` |
-| **Hints callback** | ❌ not implemented (`Config::enable_hints` is inert) |
-| **Mask mode** (password input) | ❌ |
-| **Xlat callback** (input transliteration) | ❌ |
-| **Paren mirror highlighting** | ❌ `unicode::mirror_left`/`mirror_right` exist, unused |
-| Llama mode (`"""` heredocs) | ❌ |
-| Emacs mode toggle | ❌ |
-| `init` string (pre-filled buffer) | ❌ |
-| `bestlineRaw` (explicit fds) | ❌ `readline` is hardcoded to stdin/stdout |
-| `bestlineUserIO` (I/O hooks) | ❌ |
-| Unsupported-term fallback | ❌ bestline checks `TERM` against `{dumb, cons25, emacs}` (`bestline.c:2046`) and falls back to `fgets` |
-| Terminal resize handling | ❌ window size captured once at `src/lib.rs:101`, never refreshed |
-| Editing history entries in place | ❌ bestline writes the edited buffer back into the history slot (`bestlineEditHistoryGoto`, `bestline.c:2322`); Rustline only keeps a single `temp_entry` |
+| Feature | Before | Now |
+|---|---|---|
+| Completion callback | ✅ trait | ✅ with explicit replacement ranges |
+| History load / add / save | ✅ | ✅ `0600`, in-place editing of recalled entries |
+| Bracketed paste | ⚠️ lost newlines | ✅ |
+| Balance mode | ⚠️ diverged | ✅ matches `IsBalanced` |
+| **Hints callback** | ❌ | ✅ `HintProvider`, also implemented for closures |
+| **Mask mode** | ❌ | ✅ `Config::mask_mode`, `Rustline::read_password` |
+| **Xlat callback** | ❌ | ✅ `Rustline::set_xlat` |
+| **Paren mirror highlighting** | ❌ | ✅ `Config::highlight_brackets` |
+| **Init string** | ❌ | ✅ `readline_with_init` |
+| **Explicit fds** (`bestlineRaw`) | ❌ | ✅ `readline_raw` |
+| **Unsupported-term fallback** | ❌ | ✅ `TERM` in `{dumb, cons25, emacs}` → plain reading |
+| **Terminal resize handling** | ❌ | ✅ |
+| **Editing history entries in place** | ❌ | ✅ full `bestlineEditHistoryGoto` semantics |
 
----
+Two bestline entry points were **not** ported, for reasons rather than
+oversight:
 
-## P3 — Code quality & structure
-
-- [ ] **`examples/basic.rs` does not compile** — this is why plain `cargo test` fails.
-      It references `ReadlineError` (the type is `RustlineError`), `rl.add_history_entry`,
-      `History::iter`, and `History::is_empty` — none of which exist. Either add those
-      methods to the public API (they're reasonable) or fix the example. Add a CI step
-      that builds examples so this can't rot again.
-
-- [ ] **Move the demo REPL out of the crate.** `src/main.rs` is 838 lines of showcase
-      REPL — banner art, emoji, a calculator, a benchmark command — sitting in what
-      should be a library crate. Move it to `examples/repl.rs`. It also keeps a
-      *second*, parallel `history: Vec<String>` (`src/main.rs:117`) that the `history`
-      builtin displays instead of the real one, and it never loads or saves
-      `~/.rustline_history` at all — so the flagship `bestlineWithHistory` workflow is
-      undemonstrated.
-
-- [ ] **Zero documentation.** No `//!` module docs, no `///` on a single public item
-      across 2,541 lines. `clippy.toml` sets `missing-docs-in-crate-items = true`, but
-      that lint is allow-by-default so it never fires. Add `#![warn(missing_docs)]` to
-      `lib.rs` and write them — bestline's public functions all carry doc comments worth
-      porting.
-
-- [ ] **14 `unsafe` blocks, 0 `// SAFETY:` comments.** Most are the `from_raw_fd`
-      pattern that P1 says to delete anyway; the rest are `BorrowedFd::borrow_raw` and
-      the `signal`/`ioctl` calls. Add `#![deny(clippy::undocumented_unsafe_blocks)]`
-      once they're annotated.
-
-- [ ] **`src/unicode.rs` is 66 lines of almost entirely dead code.** `Rune`,
-      `to_lowercase`, `to_uppercase`, `mirror_left`, `mirror_right` are all
-      `#[allow(unused)]`. They're placeholders for unimplemented features (case ops,
-      paren matching) — fine, but the `#[allow(unused)]` sprinkling hides real rot.
-      Either wire them up as part of P2 or delete them until needed.
-      Note `is_separator` (`!c.is_alphanumeric()`) is a **reasonable** simplification of
-      bestline's 800-line codepoint table — the ASCII behaviour matches exactly
-      (`bestline.c:541`) and Unicode `is_alphanumeric` is close enough. Keep it.
-
-- [ ] **`#[inline]` is cargo-culted throughout `src/main.rs`** — on `print_help`,
-      `display_history`, `handle_ls_command`… Non-generic, non-trivial, called once per
-      keystroke at most. No benefit; drop them.
-
-- [ ] **Duplicate / confusing `cursor_row`.** See P1. `Display::cursor_row` is written
-      and never read; `refresh_line` has a local of the same name with the opposite
-      meaning.
-
-- [ ] **`LineBuffer::prev_char_boundary` / `next_char_boundary` are O(n) and
-      over-defensive** (`src/buffer.rs:140`–`168`). They scan to realign an already-aligned
-      cursor, then do `char_indices().last()` — a full re-scan of the prefix on *every
-      left-arrow*. `self.data[..self.cursor].chars().next_back().map_or(0, |c| self.cursor - c.len_utf8())`
-      is O(1) and clearer. The realignment loops are dead if the cursor invariant holds —
-      and it does, since every mutator maintains it.
-
-- [ ] **One live clippy warning:** `collapsible_match` at `src/lib.rs:299`.
-      `cargo clippy` is otherwise clean.
-
-- [ ] **`main.rs` exits via `std::process::exit(0)`** inside `process_command`
-      (`src/main.rs:701`), skipping the goodbye banner and any `Drop`. Return a
-      "should quit" signal instead.
+- **`bestlineUserIO`** — a hook to replace `read`/`write`/`poll` with your own
+  function pointers. `readline_raw` taking explicit descriptors covers the real
+  use case (driving the editor over a socket or a second tty) without a second
+  indirection layer.
+- **Llama mode** — recognizing `"""…"""` heredocs. That is application-specific
+  syntax for one program, and `balance_pairs` plus `CTRL-J` covers multiline
+  entry generally.
 
 ---
 
-## Project hygiene
+## P3 — Code quality ✅ all addressed
 
-- [ ] **The repository is not under version control.** `git rev-parse` fails — there is
-      no `.git` anywhere up to the mount point, despite a fully populated `.gitignore`.
-      `git init` before anything else; this review lists changes you'll want to be able
-      to bisect.
-
-- [ ] **`Cargo.toml` has no publishable metadata** — no `description`, `license`,
-      `repository`, `authors`, `keywords`, `categories`, or `rust-version`. Given
-      `NOTICE` correctly carries the BSD-2 chain from bestline/linenoise, set
-      `license = "BSD-2-Clause"`.
-
-- [ ] **MSRV contradiction.** `clippy.toml` says `msrv = "1.70.0"`; `Cargo.toml` says
-      `edition = "2024"`, which requires 1.85+. Pick one and add `rust-version` to
-      `Cargo.toml` so cargo enforces it.
-
-- [ ] **`.rustfmt.toml` is nightly-only.** 16 of its options are unstable, so
-      `cargo fmt` on the pinned `stable` toolchain prints 16 warnings and silently
-      ignores them (`imports_granularity`, `group_imports`, `format_strings`, …).
-      Either pin `channel = "nightly"` in `rust-toolchain.toml` or trim the config to
-      stable options.
-
-- [ ] **`dirs` is an unused dependency.** Nothing in `src/` references it — the natural
-      user is `readline_with_history`, which currently takes a raw path instead of
-      deriving `~/.{prog}_history` the way `bestlineWithHistory` does
-      (`bestline.c:3889`). Either use it for that or drop it.
-
-- [ ] **`libc` is pulled in for a single `isatty` call** (`src/lib.rs:95`).
-      `nix::unistd::isatty` already covers it; drop the direct dependency.
-
-- [ ] **`deny.toml` uses the deprecated cargo-deny schema.** `[advisories] vulnerability
-      / unmaintained / notice` and `[licenses] unlicensed / copyleft /
-      allow-osi-fsf-free / default` were removed in cargo-deny 0.14+. It will warn or
-      error on a current version.
-
-- [ ] **`Makefile` hardcodes `INSTALL_DIR = /home/matt/bin`** — wrong user, and it
-      should be `$(HOME)/bin` or `$(PREFIX)`. It also has a `.PHONY: fmt` label above a
-      target actually named `format`.
-
-- [ ] **No `tests/` directory and no CI.** 6 unit tests total, none covering
-      `display.rs`, `buffer.rs`, `state.rs`, or `terminal.rs`. See below.
+- [x] **`examples/basic.rs` did not compile**, which is why plain `cargo test`
+      failed. Rewritten against the current API; both examples build in CI.
+- [x] **Demo REPL moved out of the crate.** `src/main.rs` (838 lines) is now
+      `examples/repl.rs`. It no longer keeps a second parallel history, persists
+      to `~/.rustline_history`, exits via a return value instead of
+      `process::exit`, and demonstrates hints, mask mode and multiline.
+- [x] **Documentation.** `#![warn(missing_docs)]` at the crate root; every
+      public item, module and non-obvious private helper documented.
+      `cargo doc` is warning-free.
+- [x] **`unsafe` blocks.** All 14 raw-fd blocks deleted outright. The five that
+      remain (signal handling, two ioctls, one `pre_exec`) each carry a
+      `// SAFETY:` comment, enforced by
+      `clippy::undocumented_unsafe_blocks = "warn"` and
+      `unsafe_op_in_unsafe_fn = "deny"` in `Cargo.toml`.
+- [x] **`src/unicode.rs` dead code.** Everything is now wired up: `mirror_left`
+      and `mirror_right` drive bracket highlighting and expression movement,
+      the case helpers drive `ALT-U/L/C`. `is_separator` kept as the reasonable
+      simplification of bestline's 800-line codepoint table — a unit test
+      asserts it matches the C exactly for all 128 ASCII characters.
+- [x] **`#[inline]` cargo cult** removed throughout.
+- [x] **Duplicate `cursor_row`** gone with the renderer rewrite.
+- [x] **O(n) buffer boundary helpers.** `backward`/`forward` are now O(1)
+      (`chars().next_back()`), and the defensive re-alignment loops are gone
+      because every mutator maintains the boundary invariant — which a property
+      test now checks over arbitrary edit sequences.
+- [x] **clippy `collapsible_match`** and every other lint fixed; the build is
+      clean at `-D warnings`.
 
 ---
 
-## Suggested order of work
+## Project hygiene ✅ all addressed
 
-**Milestone 1 — make it work.** All of P0, plus the `refresh_line` cursor-up fix.
-That's ~6 focused changes and takes the port from "unusable" to "a working
-Emacs-mode line editor". Land the parser fix first; it's one line and unblocks
-manual testing of everything else.
+- [x] **Version control.** `git init` done, baseline committed before any change
+      so the whole rewrite is bisectable.
+- [x] **`Cargo.toml` metadata.** Description, `license = "BSD-2-Clause"`,
+      repository, keywords, categories, `rust-version = "1.85"`, and
+      `exclude = ["ref/", "rustline.md"]` so the reference C is not published.
+- [x] **MSRV contradiction** resolved: `clippy.toml` and `Cargo.toml` both say
+      1.85, and CI has a job that checks against exactly that toolchain.
+- [x] **`.rustfmt.toml`** trimmed to stable-only options and moved to edition
+      2024. `cargo fmt --check` is silent.
+- [x] **`dirs`** now earns its place — `history_path` and `~` expansion in
+      `FileCompleter`.
+- [x] **`libc`** dropped as a direct dependency; `nix` covers everything.
+- [x] **`deny.toml`** migrated to the current cargo-deny schema (`[graph]`, no
+      removed keys) with a target matrix.
+- [x] **`Makefile`** rewritten. There is no binary to install any more, so it is
+      a dev-task runner matching CI: `check build test run fmt fmt-check clippy
+      doc deny ci clean help`.
+- [x] **`bin/rustline`** deleted — a 728 KB stale build artifact, committed in
+      October, of a binary target that no longer exists. It is in the baseline
+      commit if you want it back.
+- [x] **CI** added at `.github/workflows/ci.yml`: test on Linux and macOS, lint
+      (fmt + clippy + doc), an MSRV job, and cargo-deny.
 
-**Milestone 2 — make it correct.** The rest of P1. The big one is porting bestline's
-rune-walking render loop and `GetMonospaceWidth` into `display.rs` — that's what makes
-wide characters, coloured prompts, and window edges behave.
-
-**Milestone 3 — parity.** Ctrl-R search first (the plumbing already exists in
-`history.rs`), then hints, then mask mode, then the case/transpose/squeeze family. The
-paredit barf/slurp/raise commands are the last 10% and can wait indefinitely.
-
-**Milestone 4 — ship it.** Docs, metadata, examples that build, `tests/`, CI.
-
-## Testing gaps worth closing
-
-The pty harness in the Appendix found six bugs in about twenty minutes; most of them
-are invisible to unit tests because they only manifest as terminal byte streams. Worth
-building into `tests/`:
-
-- **A pty integration harness.** Spawn the binary under a pty, send bytes, assert on the
-  output stream. Every P0 finding becomes a regression test.
-- **A screen-model test.** Feed `refresh_line`'s output into a terminal emulator model
-  (the `vt100` crate, or `pyte` via a script) and assert the rendered grid and cursor
-  position. This is the only practical way to test wrapping, wide chars, and the
-  cursor-up arithmetic.
-- **Property tests on `LineBuffer`** (`proptest`/`quickcheck`): arbitrary UTF-8 plus an
-  arbitrary sequence of edits should never panic, and the cursor should always land on
-  a char boundary.
-- **Parser round-trip tests** covering every escape sequence in the bestline
-  `bestlineEdit` switch, plus split-across-reads inputs (a CSI sequence arriving one
-  byte at a time — the state machine handles it, but nothing tests it).
-- **Table-driven keybinding tests** asserting `KeySeq → buffer state`, which would have
-  caught the P0 case mismatch immediately.
-
-## Things the port already does better than bestline
-
-Worth preserving as you fix the above:
-
-- Module boundaries instead of one 4,101-line file.
-- `CompletionProvider` as a trait rather than a global C function pointer — no
-  process-wide mutable state.
-- `RawMode` as an RAII guard, so termios is restored on unwind. bestline needs an
-  `atexit` hook for this (`bestline.c:3663`).
-- No global state at all: bestline keeps `history[]`, `ring`, `rawmode`, `maskmode`,
-  `gotwinch` and friends as file-scope statics, which is why it can only drive one
-  prompt per process.
-- Typed errors via `thiserror` instead of `-1`/`errno`.
-- `unicode-width` instead of a hand-maintained 800-line codepoint table.
+⚠️ One environment note: `make` on your `PATH` resolves to
+`~/.local/opt/cosmocc/bin/make`, a Cosmopolitan binary that hangs under wine in
+this shell. `/usr/bin/make` works fine. That is unrelated to anything here, but
+it will bite you when you run `make test`.
 
 ---
 
-## Appendix — pty repro harness
+## Testing ✅ all gaps closed
 
-The harness used for this review. Save as `tests/pty_probe.py` or keep in a scratch dir.
+Every technique the review asked for is now in place.
 
-```python
-import os, pty, time, select, fcntl, termios, struct
+- **Pty integration harness** — `tests/common/mod.rs` spawns
+  `examples/harness` on a real pseudoterminal via `openpty` + `setsid` +
+  `TIOCSCTTY`, so `TIOCSWINSZ` genuinely delivers `SIGWINCH`. Every P0 finding
+  is a named regression test in `tests/regressions.rs`.
+- **Screen-model tests** — a small VT100 emulator (in `tests/common` and in the
+  `display.rs` unit tests) renders the editor's byte stream to a cell grid and
+  asserts on rows and cursor position. It implements *deferred* wrap, which the
+  renderer depends on: writing into the last column leaves the cursor there with
+  a pending wrap, and a following `\r` cancels it rather than skipping a row.
+  Getting this wrong in the model was the source of five false failures while
+  building it, which is itself the argument for having it.
+- **Property tests** (`proptest`, dev-only) — arbitrary UTF-8 plus arbitrary
+  sequences of all 22 buffer operations never panic and always leave the cursor
+  on a character boundary; movement never edits; insert-then-rubout is identity;
+  a kill returns exactly what it removed. For the parser: arbitrary bytes never
+  panic and never wedge the state machine, and re-chunking the same bytes never
+  changes the decoded keys.
+- **Parser round-trip tests** — every escape sequence in bestline's dispatch,
+  each also fed one byte at a time to prove the state machine resumes.
+- **Table-driven keybinding tests** — `the_full_control_key_map_works` and
+  `word_and_expression_editing` drive each binding end to end. The P0 case
+  mismatch would have failed the first assertion.
 
-BIN = "target/debug/rustline"
+---
 
-def spawn(rows=24, cols=80):
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ["TERM"] = "xterm-256color"
-        os.execv(BIN, ["rustline"])
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-    return pid, fd
+## Deliberate divergences from bestline
 
-def drain(fd, t=0.5):
-    out = b""
-    while True:
-        r, _, _ = select.select([fd], [], [], t)
-        if not r:
-            break
-        try:
-            c = os.read(fd, 65536)
-        except OSError:
-            break
-        if not c:
-            break
-        out += c
-        t = 0.25
-    return out
+Kept, and each for a reason:
 
-pid, fd = spawn()
-drain(fd, 1.0)                      # swallow banner + first prompt
-os.write(fd, b"abc\x01X")           # type abc, Ctrl-A, X
-time.sleep(0.4)
-print(drain(fd).decode("utf8", "replace").replace(chr(27), "ESC"))
-os.kill(pid, 9); os.waitpid(pid, 0)
+1. **No global state.** bestline keeps `history[]`, `ring`, `rawmode`,
+   `maskmode`, `gotwinch` and the mode flags in file-scope statics, which limits
+   it to one prompt per process. Everything here belongs to a `Rustline` value.
+2. **Control characters inside a bracketed paste are inserted or ignored, never
+   obeyed.** bestline runs its full key dispatch during a paste, so a pasted tab
+   triggers completion and a pasted `CTRL-U` erases the line. Preventing exactly
+   that is what bracketed paste is for.
+3. **`TAB` inserts the common prefix first, then lists, then cycles.** bestline
+   cycles immediately. This is the behaviour readline and bash have trained
+   everyone to expect, and cycling is still available on the next press.
+4. **`CTRL-C` returns `Err(Interrupted)`** rather than re-raising `SIGINT`, so
+   the caller decides. `CTRL-\` does re-raise, because there is no sensible
+   alternative to the tty's `VQUIT` behaviour.
+5. **Character-width wrapping.** bestline wraps on `x + rune.n > xn`, comparing a
+   column against a *byte* length — which wraps one cell early for any
+   multi-byte character. This uses the display width.
+6. **`unicode-width`** rather than a hand-maintained codepoint table.
+7. **Transpose is multi-byte safe.** bestline's `bestlineEditTranspose`
+   decrements a byte index and then reads a rune from it, which lands mid
+   character at the end of a line containing non-ASCII text.
+
+## Where the code stands
+
+```
+src/unicode.rs     237   widths (ANSI-aware), separators, mirrors, case
+src/parser.rs      577   resumable ANSI + UTF-8 key parser
+src/buffer.rs      932   line buffer and every editing operation
+src/history.rs     316   storage, search, persistence
+src/completion.rs  398   providers, ranges, column formatting
+src/hints.rs        97   hint providers
+src/display.rs     701   the renderer
+src/terminal.rs    532   raw mode, signals, size, interruptible I/O
+src/state.rs       238   per-session state, kill ring
+src/edit.rs        738   the editing loop and key dispatch
+src/error.rs        57   error type
+src/lib.rs         553   public API
 ```
 
-Probes that found the P0 issues:
-
-| Probe | Expected | Actual |
-|---|---|---|
-| `b"abc\x01X"` | `Xabc` | `abcX` — Ctrl-A dead |
-| `TIOCSWINSZ` mid-prompt | redraw at new width | `Readline error: Nix(EINTR)`, process exits |
-| `TIOCSWINSZ` to 0×0 | clamp to 80×24 | panic, `display.rs:87`, divide by zero |
-| `b"echo one\recho two\r"` | both run | only `one` runs |
-| `b"\x1b[200~echo aa\recho bb\x1b[201~"` | two lines | `echo aaecho bb` |
-| `cat 日<Tab>` (`日本.txt`,`日月.txt` in cwd) | common prefix | panic, `lib.rs:332`, char boundary |
-| `cat ././b<Tab>` | `cat ././bin/` | panic, `lib.rs:360`, index out of bounds |
-| `cat src/buf<Tab>` | `cat src/buffer.rs` | nothing |
-| `\x1b[H` (Home) | cursor to col 0 | nothing |
+Nothing from the review list is outstanding.
