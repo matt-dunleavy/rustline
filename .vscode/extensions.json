@@ -1,0 +1,14 @@
+{
+  "recommendations": [
+      "rust-lang.rust-analyzer",
+      "vadimcn.vscode-lldb",
+      "tamasfe.even-better-toml",
+      "serayuzgur.crates",
+      "bungcip.better-toml",
+      "editorconfig.editorconfig",
+      "usernamehw.errorlens",
+      "gruntfuggly.todo-tree",
+      "eamodio.gitlens",
+      "streetsidesoftware.code-spell-checker"
+  ]
+}
