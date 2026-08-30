@@ -16,7 +16,7 @@ different from bestline.
 | `cargo fmt --check` | 16 nightly-only warnings | clean |
 | `cargo doc` | no docs at all | clean, every public item documented |
 | Library source | 2,541 lines | 4,876 lines |
-| Tests | 6 unit | 119 unit + property, 45 pty integration |
+| Tests | 6 unit | 119 unit + property, 46 pty integration |
 | Keybindings working | 11 | 46 |
 | Version control | none | `git init`, baseline committed |
 
