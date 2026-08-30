@@ -1,12 +1,9 @@
 # Rustline
 
-A line editor for interactive terminal programs — a Rust port of
-[bestline](https://github.com/jart/bestline), which is itself a fork of
-[linenoise](https://github.com/antirez/linenoise).
+A line editor for interactive terminal programs — a Rust port of [bestline](https://github.com/jart/bestline), which is itself a fork of [linenoise](https://github.com/antirez/linenoise).
 
-Emacs-style editing, reverse history search, completion, hints, and UTF-8
-editing over ANSI X3.64 escape sequences. No terminfo, no ncurses, no terminal
-capability database — every terminal in use today speaks VT100.
+Emacs-style editing, reverse history search, completion, hints, and UTF-8 editing over ANSI X3.64 escape sequences. No terminfo, no ncurses, no terminal
+capability database.
 
 ```rust
 use rustline::{Rustline, RustlineError};
@@ -28,8 +25,7 @@ fn main() -> rustline::Result<()> {
 }
 ```
 
-Run `cargo run --example repl` for a REPL exercising every feature, or
-`cargo run --example basic` for the shortest useful program.
+Run `cargo run --example repl` for a REPL exercising every feature, or `cargo run --example basic` for the shortest useful program.
 
 ## Key bindings
 
@@ -107,16 +103,10 @@ make test      # unit, property and pseudoterminal integration tests
 make ci        # what CI runs: fmt, clippy, tests, docs
 ```
 
-The integration suite in `tests/regressions.rs` drives the editor through a real
-pseudoterminal and asserts on the resulting screen using a small VT100 model.
-That is the only way to catch the failures that matter most here: a cursor one
-row too high, a wide glyph split by the right edge, or a redraw that overwrites
-the scrollback.
+The integration suite in `tests/regressions.rs` drives the editor through a real pseudoterminal and asserts on the resulting screen using a small VT100 model. That is the only way to catch the failures that matter most here: a cursor one row too high, a wide glyph split by the right edge, or a redraw that overwrites the scrollback.
 
-`cargo test` builds the examples first, because the integration tests execute
-`examples/harness`.
+`cargo test` builds the examples first, because the integration tests execute `examples/harness`.
 
-## Licence
+## License
 
-BSD-2-Clause. See `LICENSE` for the full copyright chain back through bestline
-and linenoise.
+BSD-2-Clause. See `LICENSE` for the full copyright chain back through bestline and linenoise.

@@ -10,7 +10,17 @@ readme = "README.md"
 repository = "https://github.com/matt-dunleavy/rustline"
 keywords = ["readline", "linenoise", "terminal", "repl", "cli"]
 categories = ["command-line-interface", "text-editors"]
-exclude = ["ref/", "rustline.md"]
+# A whitelist, not a blacklist: an exclude list silently ships whatever you
+# forget to name. This keeps the reference C, the review notes, and personal
+# editor and toolchain configuration out of the published package.
+include = [
+    "src/**/*.rs",
+    "examples/*.rs",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 nix = { version = "0.30.1", features = ["term", "signal", "poll", "fs", "process"] }
