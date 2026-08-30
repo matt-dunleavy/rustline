@@ -118,5 +118,5 @@ the scrollback.
 
 ## Licence
 
-BSD-2-Clause. See `NOTICE` for the full copyright chain back through bestline
+BSD-2-Clause. See `LICENSE` for the full copyright chain back through bestline
 and linenoise.
