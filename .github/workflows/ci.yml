@@ -2,7 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # Both names, so a rename of the default branch does not silently stop CI.
+    branches: [master, main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -41,11 +43,34 @@ jobs:
   msrv:
     name: minimum supported rust version
     runs-on: ubuntu-latest
+    # The action only runs `rustup default 1.85.0`, and a rust-toolchain.toml
+    # in the working directory overrides the rustup default. Pinning the
+    # toolchain here instead means this job checks the MSRV even if someone
+    # adds that file back, rather than silently re-testing stable.
+    env:
+      RUSTUP_TOOLCHAIN: 1.85.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
+      # Prove the gate is real. The previous version of this job ran on stable
+      # and passed whatever the MSRV was.
+      - name: verify the pinned toolchain is in use
+        run: rustc --version && rustc --version | grep -q '1\.85\.0'
       - run: cargo check --all-features
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `include` in Cargo.toml is a whitelist, so a new file is left out of
+      # the crate until someone names it. Print what would ship, then build
+      # the package exactly as `cargo publish` would.
+      - run: cargo package --list
+      - run: cargo package
 
   audit:
     runs-on: ubuntu-latest

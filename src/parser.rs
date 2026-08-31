@@ -61,6 +61,15 @@ pub enum KeySeq {
     Unknown(Vec<u8>),
 }
 
+/// Longest run of `CSI` parameter and intermediate bytes kept.
+///
+/// No real terminal comes close: the longest sequence this crate decodes is
+/// five bytes of parameters. The cap matters because `readline_raw` is offered
+/// for serial lines and pseudoterminals, where the peer is not necessarily a
+/// keyboard and an endless parameter run would otherwise grow the buffer until
+/// the process died.
+const MAX_SEQ: usize = 64;
+
 /// Converts a C0 byte to its normalized control character.
 ///
 /// `0x01`..=`0x1a` map to `a`..=`z`; the remaining C0 bytes map to the ASCII
@@ -219,11 +228,28 @@ impl Parser {
 
     fn csi(&mut self, byte: u8, keys: &mut Vec<KeySeq>) {
         match byte {
-            // Parameter and intermediate bytes accumulate.
-            0x20..=0x3f => self.seq.push(byte),
+            // Parameter and intermediate bytes accumulate, up to `MAX_SEQ`.
+            // Bytes past the cap are dropped rather than ending the sequence
+            // early, so the parser still resynchronizes on the final byte
+            // instead of treating the rest of the run as typed characters.
+            0x20..=0x3f => {
+                if self.seq.len() < MAX_SEQ {
+                    self.seq.push(byte);
+                }
+            }
             // A final byte terminates the sequence.
             0x40..=0x7e => {
-                if let Some(key) = self.decode_csi(byte) {
+                // A truncated parameter list must not be decoded: the bytes
+                // that were dropped could have changed what it means.
+                let key = if self.seq.len() < MAX_SEQ {
+                    self.decode_csi(byte)
+                } else {
+                    let mut bytes = vec![0x1b, b'['];
+                    bytes.append(&mut self.seq);
+                    bytes.push(byte);
+                    Some(KeySeq::Unknown(bytes))
+                };
+                if let Some(key) = key {
                     keys.push(key);
                 }
                 self.reset();
@@ -557,6 +583,47 @@ mod tests {
                 .collect();
             proptest::prop_assert_eq!(decoded, text);
         }
+    }
+
+    /// A peer that never sends a final byte must not be able to grow the
+    /// parser's buffer without bound. `readline_raw` is offered for serial
+    /// lines, where the other end is not necessarily friendly.
+    #[test]
+    fn a_runaway_csi_parameter_run_is_bounded() {
+        let mut parser = Parser::new();
+        let mut input = vec![0x1b, b'['];
+        input.extend(std::iter::repeat_n(b'1', 100_000));
+
+        assert!(
+            parser.parse(&input).is_empty(),
+            "no key can be complete yet"
+        );
+        assert!(!parser.is_idle(), "the sequence is still open");
+        assert!(parser.seq.len() <= MAX_SEQ, "the buffer grew without bound");
+
+        // The sequence still ends where the stream says it does, and reports
+        // itself as unrecognized rather than being decoded from a parameter
+        // list most of which was thrown away.
+        let keys = parser.parse(b"A");
+        assert!(
+            matches!(keys.as_slice(), [KeySeq::Unknown(_)]),
+            "expected one unknown sequence, got {keys:?}",
+        );
+        assert!(parser.is_idle());
+
+        // And the parser is back in step with the stream.
+        assert_eq!(parser.parse(b"x"), vec![KeySeq::Char('x')]);
+    }
+
+    /// The cap must be nowhere near any sequence a terminal really sends.
+    #[test]
+    fn ordinary_sequences_are_well_inside_the_cap() {
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse(b"\x1b[1;3C"), vec![KeySeq::AltRight]);
+        assert_eq!(
+            parser.parse(b"\x1b[200~"),
+            vec![KeySeq::BracketedPasteStart]
+        );
     }
 
     #[test]

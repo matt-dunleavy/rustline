@@ -1,11 +1,22 @@
 //! Command history: storage, navigation state, persistence and search.
 
-use crate::error::Result;
+use crate::error::{Result, RustlineError};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+/// Mode the history file is created and kept at: readable by its owner only.
+const PRIVATE: u32 = 0o600;
+
+/// Wraps an I/O failure with the history file it happened on.
+fn at(path: &Path, source: std::io::Error) -> RustlineError {
+    RustlineError::History {
+        path: path.to_path_buf(),
+        source,
+    }
+}
 
 /// Ring of previously entered lines, oldest first.
 ///
@@ -23,8 +34,8 @@ pub struct History {
 impl History {
     /// Creates an empty history holding at most `max_size` entries.
     ///
-    /// A `max_size` of zero is treated as one, since the editor always needs a
-    /// scratch slot for the line being typed.
+    /// A `max_size` of zero is treated as one: a history that cannot hold
+    /// anything would make every navigation key a silent no-op.
     #[must_use]
     pub fn new(max_size: usize) -> Self {
         History {
@@ -83,8 +94,8 @@ impl History {
 
     /// Appends `line` unconditionally, evicting the oldest entry if full.
     ///
-    /// The editor uses this to create the scratch slot that holds the line
-    /// currently being typed.
+    /// Unlike [`History::add`] this keeps empty lines and consecutive
+    /// duplicates, which is what reloading a file or resizing the ring needs.
     pub fn push(&mut self, line: String) {
         self.entries.push_back(line);
         while self.entries.len() > self.max_size {
@@ -93,6 +104,9 @@ impl History {
     }
 
     /// Removes and returns the newest entry.
+    ///
+    /// The line being typed is *not* stored here, so this always removes an
+    /// entry the user actually entered.
     pub fn pop(&mut self) -> Option<String> {
         self.entries.pop_back()
     }
@@ -136,21 +150,40 @@ impl History {
 
     /// Replaces the history with the contents of `path`.
     ///
-    /// A missing file is not an error and leaves the history untouched.
+    /// A missing file is not an error and leaves the history untouched. A line
+    /// that is not valid UTF-8 is skipped rather than failing the load: one
+    /// corrupt byte in a history file must not cost the caller their prompt.
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(at(path, e)),
         };
 
         // Collect first, then keep the newest `max_size` lines. Trimming as we
         // go would be O(n^2) on a long file.
+        let mut reader = BufReader::new(file);
         let mut lines = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if !line.is_empty() {
-                lines.push(line);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            // Read bytes rather than `lines()`, which gives up at the first
+            // byte that is not UTF-8 instead of skipping that entry.
+            if reader
+                .read_until(b'\n', &mut raw)
+                .map_err(|e| at(path, e))?
+                == 0
+            {
+                break;
+            }
+            if raw.last() == Some(&b'\n') {
+                raw.pop();
+            }
+            if let Ok(line) = std::str::from_utf8(&raw) {
+                if !line.is_empty() {
+                    lines.push(line.to_string());
+                }
             }
         }
         if lines.len() > self.max_size {
@@ -164,23 +197,75 @@ impl History {
 
     /// Writes the history to `path` with mode `0600`.
     ///
-    /// History routinely contains credentials, so the file is created
-    /// user-readable only, as bestline does.
+    /// History routinely contains credentials, so the file is user-readable
+    /// only. The mode is enforced on every save, not just on creation, so a
+    /// history file that was already world-readable is tightened rather than
+    /// left as it was.
+    ///
+    /// The write goes to a sibling temporary file that is renamed over `path`,
+    /// so a crash or a full disk leaves the previous history intact instead of
+    /// a truncated one. `path` is resolved first, so saving through a symlink
+    /// replaces its target rather than the link.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let path = path.as_ref();
+        let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let temp = temp_path(path);
+
+        match self.write_to(&temp) {
+            Ok(()) => std::fs::rename(&temp, path).map_err(|e| at(path, e)),
+            Err(e) => {
+                // Leaving the partial file behind would be picked up as a stale
+                // temporary by the next save, or read as history by a glob.
+                let _ = std::fs::remove_file(&temp);
+                Err(e)
+            }
+        }
+    }
+
+    /// Writes every entry to `temp`, which is created private and made private
+    /// again if it already existed with a looser mode.
+    fn write_to(&self, temp: &Path) -> Result<()> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
-            .open(path)?;
+            .mode(PRIVATE)
+            .open(temp)
+            .map_err(|e| at(temp, e))?;
+
+        // `mode` above applies only when the file is created, so a leftover
+        // temporary from a crashed save could still be world-readable.
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE))
+            .map_err(|e| at(temp, e))?;
 
         let mut out = BufWriter::new(file);
         for entry in &self.entries {
-            out.write_all(entry.as_bytes())?;
-            out.write_all(b"\n")?;
+            out.write_all(entry.as_bytes()).map_err(|e| at(temp, e))?;
+            out.write_all(b"\n").map_err(|e| at(temp, e))?;
         }
-        out.flush()?;
-        Ok(())
+        out.flush().map_err(|e| at(temp, e))?;
+        // The rename is only atomic for the caller if the bytes are on disk
+        // before it happens; otherwise a crash can leave an empty new file.
+        out.into_inner()
+            .map_err(|e| at(temp, e.into_error()))?
+            .sync_all()
+            .map_err(|e| at(temp, e))
+    }
+}
+
+/// Sibling path used for the temporary file `save` renames into place.
+///
+/// The pid keeps two processes saving the same history at once from writing
+/// through each other's temporary file.
+fn temp_path(path: &Path) -> PathBuf {
+    let name = path.file_name().map_or_else(
+        || "history".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let temp = format!(".{name}.{}.tmp", std::process::id());
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(temp),
+        _ => PathBuf::from(temp),
     }
 }
 
@@ -252,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn save_overwrites_a_permissive_existing_file() {
+    fn save_tightens_a_permissive_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hist");
         std::fs::write(&path, "old\n").unwrap();
@@ -262,11 +347,83 @@ mod tests {
         h.add("new");
         h.save(&path).unwrap();
 
-        // The mode of an existing file is not changed by `open`, so tightening
-        // it is the caller's job; assert the contents at least round-trip.
+        // `open` never changes the mode of a file that already exists, so a
+        // history left world-readable by an earlier version, or by a careless
+        // `touch`, used to stay world-readable forever.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "an existing history was not tightened");
+
         let mut loaded = History::new(10);
         loaded.load(&path).unwrap();
         assert_eq!(loaded.iter().collect::<Vec<_>>(), ["new"]);
+    }
+
+    #[test]
+    fn save_leaves_no_temporary_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+
+        let mut h = History::new(10);
+        h.add("only");
+        h.save(&path).unwrap();
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["hist"], "the temporary file was not renamed away");
+    }
+
+    #[test]
+    fn save_through_a_symlink_replaces_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::write(&real, "old\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut h = History::new(10);
+        h.add("new");
+        h.save(&link).unwrap();
+
+        assert!(link.is_symlink(), "the symlink was replaced by a file");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn save_reports_the_file_it_could_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-dir").join("hist");
+
+        let err = History::new(10).save(&path).unwrap_err();
+        assert!(
+            matches!(err, RustlineError::History { .. }),
+            "expected a history error, got {err:?}",
+        );
+        assert!(err.to_string().contains("hist"));
+    }
+
+    #[test]
+    fn load_skips_lines_that_are_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+        // One corrupt entry between two good ones must cost only itself.
+        std::fs::write(&path, b"good one\n\xff\xfe bad\ngood two\n").unwrap();
+
+        let mut h = History::new(10);
+        h.load(&path).unwrap();
+        assert_eq!(h.iter().collect::<Vec<_>>(), ["good one", "good two"]);
+    }
+
+    #[test]
+    fn load_reads_a_final_line_without_a_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist");
+        std::fs::write(&path, "a\nb").unwrap();
+
+        let mut h = History::new(10);
+        h.load(&path).unwrap();
+        assert_eq!(h.iter().collect::<Vec<_>>(), ["a", "b"]);
     }
 
     #[test]

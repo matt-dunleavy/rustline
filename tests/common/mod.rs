@@ -12,20 +12,30 @@ use nix::pty::openpty;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
-/// Locates a built example binary.
+/// Locates a built example binary, building the examples first.
 ///
-/// Test binaries live in `<target>/<profile>/deps`, so the examples that
-/// `cargo test` builds alongside them are two directories up.
-fn example_path(name: &str) -> PathBuf {
+/// Test binaries live in `<target>/<profile>/deps`, so the example binaries sit
+/// two directories up. They have to be built here because `cargo test` compiles
+/// the examples as *test* targets without refreshing those binaries: on its own
+/// it would run this suite against whatever stale harness was left in the
+/// directory, or none at all on a fresh checkout. Building costs one no-op
+/// cargo invocation and makes a bare `cargo test` as trustworthy as CI.
+pub fn example_path(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("test binary path");
     let profile_dir = exe
         .parent()
         .and_then(|p| p.parent())
         .expect("target/<profile>");
+
+    // Once per test binary, however many threads arrive at once.
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| build_examples(profile_dir));
+
     let path = profile_dir.join("examples").join(name);
     assert!(
         path.exists(),
@@ -33,6 +43,39 @@ fn example_path(name: &str) -> PathBuf {
         path.display(),
     );
     path
+}
+
+/// Runs `cargo build --examples` into the target directory and profile the
+/// running test binary came from.
+///
+/// Cargo releases its build lock before it runs the tests, so this nested
+/// invocation does not deadlock against the `cargo test` that started us.
+fn build_examples(profile_dir: &Path) {
+    // Cargo sets `CARGO` for the binaries it runs; the fallback is for a test
+    // binary invoked directly, where the assert above explains any failure.
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let target_dir = profile_dir.parent().expect("<target>/<profile>");
+    let profile = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("debug");
+
+    let mut command = Command::new(cargo);
+    command
+        .args(["build", "--examples"])
+        .arg("--target-dir")
+        .arg(target_dir);
+    // The `dev` profile builds into `debug`, and is the default; every other
+    // profile is named by the directory it builds into.
+    if profile != "debug" {
+        command.arg("--profile").arg(profile);
+    }
+
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("`cargo build --examples` failed: {status}"),
+        Err(e) => panic!("could not run `cargo build --examples`: {e}"),
+    }
 }
 
 /// A child process attached to its own pseudoterminal.

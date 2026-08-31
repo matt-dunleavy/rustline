@@ -49,7 +49,7 @@
 //! TAB               complete             CTRL-Z          suspend
 //! ALT-SHIFT-B       barf expression      CTRL-\          quit
 //! ALT-SHIFT-S       slurp expression     CTRL-S / CTRL-Q flow control
-//!                                        CTRL-Q          escaped insert
+//! CTRL-J            new line             CTRL-Q          escaped insert
 //! ```
 //!
 //! [bestline]: https://github.com/jart/bestline
@@ -105,7 +105,8 @@ pub struct Config {
     /// literal tab character.
     pub enable_completion: bool,
     /// Allow an entry to span several lines. When disabled, `CTRL-J` submits
-    /// the line like `ENTER` and [`Config::balance_pairs`] has no effect.
+    /// the line like `ENTER`, [`Config::balance_pairs`] has no effect, and a
+    /// newline inside a bracketed paste becomes a space.
     pub enable_multiline: bool,
     /// Ask the terminal to bracket pasted text, so a paste containing newlines
     /// or control characters is inserted rather than executed.
@@ -276,6 +277,15 @@ impl Rustline {
     }
 
     /// Reads one line as a masked password, without recording it in history.
+    ///
+    /// Completion and history search are both suppressed while the input is
+    /// masked, since either would print what was typed in plaintext.
+    ///
+    /// Two limits are worth knowing about. The password is an ordinary
+    /// `String` and is never zeroized, so it stays in the heap until the
+    /// allocator reuses that memory; use a crate such as `zeroize` if that
+    /// matters. And [`Config::mask_mode`] is restored on the normal path only,
+    /// so if the editor panics the value is left in mask mode.
     pub fn read_password(&mut self, prompt: &str) -> Result<String> {
         let was_masked = self.config.mask_mode;
         self.config.mask_mode = true;

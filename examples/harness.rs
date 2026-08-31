@@ -33,12 +33,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
+    // A small history makes eviction observable in a test that only has to
+    // type a handful of lines.
+    let history_max_size = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--history-max="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1024);
+
     let config = Config {
         balance_pairs: has("--balance"),
         enable_multiline: !has("--no-multiline"),
         enable_hints: has("--hints"),
         mask_mode: has("--mask"),
         highlight_brackets: !has("--no-highlight"),
+        history_max_size,
         ..Default::default()
     };
 

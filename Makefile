@@ -16,6 +16,9 @@ check:
 build:
 	$(CARGO) build --release --all-targets
 
+# No separate build step: `cargo test` compiles the examples as test targets
+# without refreshing the example binaries the pseudoterminal suite executes, so
+# the suite builds those itself. See `example_path` in tests/common/mod.rs.
 ## Run every test, including the pseudoterminal integration suite.
 .PHONY: test
 test:
@@ -51,9 +54,23 @@ doc:
 deny:
 	$(CARGO) deny check
 
-## Everything CI runs.
+## List what would ship and build the crate exactly as `cargo publish` would.
+.PHONY: package
+package:
+	$(CARGO) package --list
+	$(CARGO) package
+
+# Not part of `ci`: it needs the 1.85.0 toolchain installed, which a working
+# copy will not always have. RUSTUP_TOOLCHAIN is what actually pins the
+# version; `rustup run` would be overridden by a rust-toolchain.toml.
+## Check that the crate still builds on the minimum supported Rust version.
+.PHONY: msrv
+msrv:
+	RUSTUP_TOOLCHAIN=1.85.0 $(CARGO) check --all-features
+
+## Everything CI runs, apart from the MSRV check and the dependency audit.
 .PHONY: ci
-ci: fmt-check clippy test doc
+ci: fmt-check clippy test doc package
 
 ## Remove build artifacts.
 .PHONY: clean

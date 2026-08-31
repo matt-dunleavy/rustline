@@ -327,6 +327,33 @@ fn linefeed_always_continues() {
     assert_eq!(pty.lines(), ["one\ntwo"]);
 }
 
+/// With multiline entry disabled, `CTRL-J` submits the line instead of opening
+/// a continuation line. The config flag used to be inert.
+#[test]
+fn linefeed_submits_when_multiline_is_disabled() {
+    let mut pty = Pty::spawn(&["--no-multiline"], 24, 80);
+    pty.type_keys(b"one\x0atwo\r");
+    assert_eq!(pty.lines(), ["one", "two"]);
+}
+
+/// Disabling multiline entry also disables balancing, since waiting for a
+/// closing paren means opening a continuation line.
+#[test]
+fn balance_is_ignored_when_multiline_is_disabled() {
+    let mut pty = Pty::spawn(&["--balance", "--no-multiline"], 24, 80);
+    pty.type_keys(b"(a\r");
+    assert_eq!(pty.lines(), ["(a"]);
+}
+
+/// A pasted newline has nowhere to go when multiline entry is disabled, so it
+/// becomes a space rather than joining the words or executing the line.
+#[test]
+fn pasted_newline_becomes_a_space_when_multiline_is_disabled() {
+    let mut pty = Pty::spawn(&["--no-multiline"], 24, 80);
+    pty.type_keys(b"\x1b[200~alpha\rbeta\x1b[201~\r");
+    assert_eq!(pty.lines(), ["alpha beta"]);
+}
+
 /// Reverse search finds an earlier entry and `ENTER` accepts it.
 #[test]
 fn reverse_search_recalls_an_entry() {
@@ -504,15 +531,7 @@ fn a_pipe_falls_back_to_plain_reading() {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let exe = std::env::current_exe().unwrap();
-    let harness = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/harness");
-
-    let mut child = Command::new(harness)
+    let mut child = Command::new(common::example_path("harness"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .env("TERM", "xterm-256color")
@@ -685,4 +704,116 @@ fn buffered_caller_output_is_flushed_before_the_prompt() {
 
     pty.type_keys(b"ok\r");
     assert_eq!(pty.lines(), ["unflushed", "ok"]);
+}
+
+/// Every `readline` call used to push a scratch slot into the history and pop
+/// it again. On a full history the push evicted the oldest entry and the pop
+/// did not bring it back, so each line the caller chose not to store — a blank
+/// ENTER, a `CTRL-C`, a duplicate — permanently cost one old entry.
+#[test]
+fn a_line_that_is_not_stored_does_not_evict_an_old_one() {
+    let mut pty = Pty::spawn(&["--history-max=3"], 24, 80);
+    pty.type_keys(b"one\rtwo\rthree\r");
+
+    // Three submissions that store nothing: a blank line, a CTRL-C, and a
+    // duplicate of the newest entry.
+    pty.type_keys(b"\r");
+    pty.type_keys(b"abandoned\x03");
+    pty.type_keys(b"three\r");
+
+    // Walking to the oldest entry must still reach "one".
+    pty.type_keys(b"\x1b<\r");
+    assert_eq!(pty.lines().last().unwrap(), "one");
+}
+
+/// `ALT->` returns to the line that was being typed, which is held outside the
+/// history rather than in a slot of its own.
+#[test]
+fn the_line_being_typed_survives_a_walk_to_the_oldest_entry() {
+    let mut pty = Pty::spawn(&["--history-max=3"], 24, 80);
+    pty.type_keys(b"one\rtwo\r");
+
+    pty.type_keys(b"draft");
+    pty.type_keys(b"\x1b<");
+    pty.type_keys(b"\x1b>");
+    pty.type_keys(b"\r");
+    assert_eq!(pty.lines()[2], "draft");
+}
+
+/// Reverse search must find the newest entry, not skip past it.
+#[test]
+fn reverse_search_can_match_the_newest_entry() {
+    let mut pty = Pty::spawn(&[], 24, 80);
+    pty.type_keys(b"needle here\r");
+
+    // From an empty line, with the cursor at column zero.
+    pty.type_keys(b"\x12needle\r");
+    assert_eq!(pty.lines()[1], "needle here");
+}
+
+/// `TAB` at a masked prompt ran the completer against the password and printed
+/// its candidates in plaintext under the asterisks.
+#[test]
+fn mask_mode_does_not_run_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two candidates sharing the typed prefix, so there is nothing to insert
+    // and the old code fell through to printing the list under the asterisks.
+    std::fs::write(dir.path().join("secret-alpha.txt"), "").unwrap();
+    std::fs::write(dir.path().join("secret-beta.txt"), "").unwrap();
+    let base = dir.path().to_str().unwrap();
+
+    let mut pty = Pty::spawn(&["--mask", "--files", "--prompt=pw: "], 24, 80);
+    pty.clear();
+    pty.type_keys(format!("{base}/secret-").as_bytes());
+    pty.type_keys(b"\t");
+
+    let output = pty.output();
+    assert!(
+        !output.contains("secret-alpha.txt") && !output.contains("secret-beta.txt"),
+        "completion listed candidates for the masked input: {output:?}",
+    );
+    assert!(
+        !output.contains("secret-"),
+        "the masked input reached the screen: {output:?}",
+    );
+}
+
+/// `CTRL-R` at a masked prompt drew the search needle in plaintext inside the
+/// prompt, which `refresh` never masks.
+#[test]
+fn mask_mode_does_not_search_history() {
+    let mut pty = Pty::spawn(&["--mask", "--prompt=pw: "], 24, 80);
+    // A stored entry, so a search would have something to find.
+    pty.type_keys(b"hello world\r");
+    pty.clear();
+
+    pty.type_keys(b"\x12hello");
+
+    let output = pty.output();
+    assert!(
+        !output.contains("reverse-i-search"),
+        "the search prompt appeared at a masked prompt: {output:?}",
+    );
+    assert!(
+        !output.contains("hello"),
+        "the needle was drawn in plaintext: {output:?}",
+    );
+
+    // The keys still edit the line, which is drawn masked as usual. Only
+    // results reported since the `clear` above are visible here.
+    pty.type_keys(b"\r");
+    assert_eq!(pty.lines(), ["hello"]);
+}
+
+/// An endless run of CSI parameter bytes must neither grow the parser's buffer
+/// without bound nor be mistaken for typed characters once it ends.
+#[test]
+fn a_runaway_escape_sequence_does_not_reach_the_line() {
+    let mut pty = Pty::spawn(&[], 24, 80);
+    pty.send(b"ab\x1b[");
+    pty.send(&vec![b'1'; 4096]);
+    pty.type_keys(b"Xcd\r");
+
+    assert!(!pty.panicked());
+    assert_eq!(pty.lines(), ["abcd"]);
 }

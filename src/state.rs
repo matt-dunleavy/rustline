@@ -85,9 +85,18 @@ pub struct EditorState {
     /// Lines already accepted as part of a multi-line entry, newline separated
     /// and ending with a newline when non-empty.
     pub accumulated: String,
-    /// Position in history counted from the newest entry, where 0 is the
-    /// scratch slot holding the line being typed.
+    /// Position in history, where 0 is the line being typed and 1 is the
+    /// newest stored entry.
+    ///
+    /// The line being typed deliberately lives here rather than in a scratch
+    /// slot at the end of the [`crate::History`]: a slot pushed onto a full
+    /// history evicts the oldest entry, and popping it again does not bring
+    /// that entry back, so every line the caller chose not to store used to
+    /// cost one old one.
     pub history_index: usize,
+    /// The line being typed, saved while [`EditorState::history_index`] points
+    /// at a stored entry.
+    pub scratch: String,
     /// Byte range of the most recent yank, so `ALT-Y` can replace it.
     pub last_yank: Option<(usize, usize)>,
     /// Input descriptor.
@@ -132,6 +141,7 @@ impl EditorState {
             continuation: continuation.to_string(),
             accumulated: String::new(),
             history_index: 0,
+            scratch: String::new(),
             last_yank: None,
             ifd,
             ofd,

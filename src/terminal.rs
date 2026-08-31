@@ -1,6 +1,6 @@
 //! Terminal control: raw mode, signals, window size, and interruptible I/O.
 
-use crate::error::Result;
+use crate::error::{Result, RustlineError};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::termios::{self, Termios};
@@ -101,7 +101,8 @@ impl RawMode {
     /// Puts `fd` into raw mode and installs the resize and resume handlers.
     pub fn enable(fd: RawFd) -> Result<Self> {
         let borrowed = borrow(fd);
-        let original = termios::tcgetattr(borrowed)?;
+        let original = termios::tcgetattr(borrowed)
+            .map_err(|e| RustlineError::Terminal(format!("cannot read attributes: {e}")))?;
 
         let mut guard = RawMode {
             fd,
@@ -155,7 +156,8 @@ impl RawMode {
         raw.control_flags |= termios::ControlFlags::CS8;
         raw.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
         raw.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
-        termios::tcsetattr(borrow(self.fd), termios::SetArg::TCSANOW, &raw)?;
+        termios::tcsetattr(borrow(self.fd), termios::SetArg::TCSANOW, &raw)
+            .map_err(|e| RustlineError::Terminal(format!("cannot enter raw mode: {e}")))?;
         self.active = true;
         Ok(())
     }
@@ -165,7 +167,8 @@ impl RawMode {
     /// Used before suspending the process, so the shell inherits a sane tty.
     pub fn disable(&mut self) -> Result<()> {
         if self.active {
-            termios::tcsetattr(borrow(self.fd), termios::SetArg::TCSANOW, &self.original)?;
+            termios::tcsetattr(borrow(self.fd), termios::SetArg::TCSANOW, &self.original)
+                .map_err(|e| RustlineError::Terminal(format!("cannot leave raw mode: {e}")))?;
             self.active = false;
         }
         Ok(())
@@ -223,15 +226,22 @@ fn borrow(fd: RawFd) -> BorrowedFd<'static> {
     unsafe { BorrowedFd::borrow_raw(fd) }
 }
 
+/// Returns `true` if `term` names a terminal that cannot render escape codes.
+///
+/// Split out from [`is_unsupported_term`] so the rule can be tested without
+/// writing to the environment: `set_var` is unsound while any other thread is
+/// *reading* the environment, and this crate's other tests read `$HOME`.
+#[must_use]
+fn is_unsupported_term_name(term: &str) -> bool {
+    UNSUPPORTED_TERMS
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(term))
+}
+
 /// Returns `true` if `$TERM` names a terminal that cannot render escape codes.
 #[must_use]
 pub fn is_unsupported_term() -> bool {
-    match std::env::var("TERM") {
-        Ok(term) => UNSUPPORTED_TERMS
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&term)),
-        Err(_) => false,
-    }
+    std::env::var("TERM").is_ok_and(|term| is_unsupported_term_name(&term))
 }
 
 /// Returns `true` if `fd` refers to a terminal.
@@ -476,17 +486,35 @@ mod tests {
 
     #[test]
     fn unsupported_terminals_are_recognized() {
-        // SAFETY: `set_var` is unsound only when another thread reads the
-        // environment concurrently. Rust runs each test on its own thread, but
-        // no other test in this crate touches TERM, so nothing races here.
-        unsafe { std::env::set_var("TERM", "dumb") };
-        assert!(is_unsupported_term());
-        // SAFETY: as above.
-        unsafe { std::env::set_var("TERM", "xterm-256color") };
-        assert!(!is_unsupported_term());
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("TERM") };
-        assert!(!is_unsupported_term());
+        assert!(is_unsupported_term_name("dumb"));
+        assert!(is_unsupported_term_name("DUMB"));
+        assert!(is_unsupported_term_name("cons25"));
+        assert!(is_unsupported_term_name("emacs"));
+
+        assert!(!is_unsupported_term_name("xterm-256color"));
+        assert!(!is_unsupported_term_name("dumb-but-not-really"));
+        assert!(!is_unsupported_term_name(""));
+
+        // Whatever the environment says, reading it must not panic. This used
+        // to be a `set_var` test, which is unsound while another thread reads
+        // any environment variable, and the history tests read `$HOME`.
+        let _ = is_unsupported_term();
+    }
+
+    /// A descriptor that is not a terminal must say so as a terminal error,
+    /// not as a bare errno.
+    #[test]
+    fn raw_mode_on_a_pipe_is_a_terminal_error() {
+        use std::os::fd::AsRawFd;
+        let (r, _w) = nix::unistd::pipe().unwrap();
+        let Err(err) = RawMode::enable(r.as_raw_fd()) else {
+            panic!("a pipe was accepted as a terminal");
+        };
+        assert!(
+            matches!(err, RustlineError::Terminal(_)),
+            "expected a terminal error, got {err:?}",
+        );
+        assert!(err.to_string().starts_with("terminal error:"));
     }
 
     #[test]

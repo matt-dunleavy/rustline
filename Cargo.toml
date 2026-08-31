@@ -8,6 +8,8 @@ authors = ["Matthew J. Dunleavy <matthewjdunleavy@gmail.com>"]
 license = "BSD-2-Clause"
 readme = "README.md"
 repository = "https://github.com/matt-dunleavy/rustline"
+homepage = "https://github.com/matt-dunleavy/rustline"
+documentation = "https://docs.rs/rustline"
 keywords = ["readline", "linenoise", "terminal", "repl", "cli"]
 categories = ["command-line-interface", "text-editors"]
 # A whitelist, not a blacklist: an exclude list silently ships whatever you
@@ -19,6 +21,7 @@ include = [
     "tests/**/*.rs",
     "Cargo.toml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
 ]
 

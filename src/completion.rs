@@ -127,9 +127,11 @@ impl FileCompleter {
 
 /// Start of the shell-like word ending at `pos`.
 ///
-/// The word extends back to the last unescaped whitespace. Path separators do
-/// *not* end a word: a completion for `src/buf` has to see the whole `src/buf`
-/// in order to know which directory to read.
+/// The word extends back to the last whitespace character. Backslashes are not
+/// treated as escapes, so `cat foo\ bar` is two words; a provider that needs
+/// shell quoting rules has to split the line itself. Path separators do *not*
+/// end a word: a completion for `src/buf` has to see the whole `src/buf` in
+/// order to know which directory to read.
 #[must_use]
 pub fn word_start(line: &str, pos: usize) -> usize {
     line[..pos]

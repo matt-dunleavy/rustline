@@ -76,13 +76,19 @@ fn escape_key(key: &KeySeq) -> String {
 }
 
 /// Builds the `reverse-i-search` prompt, underlining the matched prefix.
+///
+/// `matched` counts characters, not bytes, so the split is a character boundary
+/// whatever the needle is encoded as and the slicing cannot panic.
 fn search_prompt(failed: bool, needle: &str, matched: usize) -> String {
-    let matched = matched.min(needle.len());
+    let split = needle
+        .char_indices()
+        .nth(matched)
+        .map_or(needle.len(), |(i, _)| i);
     format!(
         "({}reverse-i-search `\x1b[4m{}\x1b[24m{}') ",
         if failed { "failed " } else { "" },
-        &needle[..matched],
-        &needle[matched..],
+        &needle[..split],
+        &needle[split..],
     )
 }
 
@@ -94,10 +100,11 @@ impl Rustline {
         raw: &mut RawMode,
         init: &str,
     ) -> Result<String> {
-        // A scratch slot at the newest end of history holds the line being
-        // typed, so moving up and back down restores it.
-        self.history.push(String::new());
+        // The line being typed lives in `state.scratch`, not in a slot at the
+        // newest end of the history: pushing one onto a full history evicts the
+        // oldest entry, and popping it again does not bring that entry back.
         state.history_index = 0;
+        state.scratch.clear();
 
         if !init.is_empty() {
             state.buffer.insert(init);
@@ -108,18 +115,9 @@ impl Rustline {
             while let Some(key) = self.pending.pop_front() {
                 match self.dispatch(state, raw, key)? {
                     Flow::Continue => {}
-                    Flow::Accept(line) => {
-                        self.history.pop();
-                        return Ok(line);
-                    }
-                    Flow::Eof => {
-                        self.history.pop();
-                        return Err(RustlineError::Eof);
-                    }
-                    Flow::Interrupted => {
-                        self.history.pop();
-                        return Err(RustlineError::Interrupted);
-                    }
+                    Flow::Accept(line) => return Ok(line),
+                    Flow::Eof => return Err(RustlineError::Eof),
+                    Flow::Interrupted => return Err(RustlineError::Interrupted),
                 }
             }
 
@@ -128,7 +126,6 @@ impl Rustline {
             }
 
             if !self.read_more(state, raw)? {
-                self.history.pop();
                 // An empty buffer with no input left is end of file; otherwise
                 // treat the pending text as if the user had pressed enter.
                 let text = state.full_text();
@@ -309,11 +306,13 @@ impl Rustline {
             KeySeq::Ctrl('p') | KeySeq::Up => self.history_move(state, 1),
             KeySeq::Ctrl('n') | KeySeq::Down => self.history_move(state, -1),
             KeySeq::Alt('<') => {
-                let oldest = self.history.len().saturating_sub(1);
+                let oldest = self.oldest_index();
                 self.history_goto(state, oldest);
             }
             KeySeq::Alt('>') => self.history_goto(state, 0),
-            KeySeq::Ctrl('r') => {
+            // Searching a masked prompt would draw the needle in plaintext, and
+            // an application's command history has nothing to offer a password.
+            KeySeq::Ctrl('r') if !state.mask => {
                 if let Some(key) = self.search(state, raw)? {
                     self.pending.push_front(key);
                 }
@@ -409,11 +408,22 @@ impl Rustline {
 
             // ---------------------------------------------------- submission
             KeySeq::Enter => return self.accept(state),
-            KeySeq::LineFeed => self.continue_line(state)?,
+            // With multiline entry off there is no continuation line to start,
+            // so CTRL-J submits like ENTER rather than doing nothing.
+            KeySeq::LineFeed => {
+                if self.config.enable_multiline {
+                    self.continue_line(state)?;
+                } else {
+                    return self.accept(state);
+                }
+            }
 
             // ---------------------------------------------------- completion
+            // Completion is off at a masked prompt: the completer would be
+            // handed the password and its candidates printed in plaintext
+            // under the asterisks.
             KeySeq::Tab => {
-                if self.config.enable_completion {
+                if self.config.enable_completion && !state.mask {
                     self.complete(state)?;
                 } else {
                     state.buffer.insert_char('\t');
@@ -444,7 +454,16 @@ impl Rustline {
             KeySeq::Char(c) => state.buffer.insert_char(c),
             KeySeq::Tab => state.buffer.insert_char('\t'),
             // A newline in pasted text is a real newline, not a submission.
-            KeySeq::Enter | KeySeq::LineFeed => self.continue_line(state)?,
+            // With multiline entry off there is nowhere to put one, so it
+            // becomes a space: joining the words outright would be worse, and
+            // executing the pasted line is what bracketed paste exists to stop.
+            KeySeq::Enter | KeySeq::LineFeed => {
+                if self.config.enable_multiline {
+                    self.continue_line(state)?;
+                } else {
+                    state.buffer.insert_char(' ');
+                }
+            }
             _ => {}
         }
         Ok(Flow::Continue)
@@ -452,7 +471,11 @@ impl Rustline {
 
     /// Handles `ENTER`: submit, unless the line is still open.
     fn accept(&mut self, state: &mut EditorState) -> Result<Flow> {
-        let finished = !self.config.balance_pairs || is_balanced(&state.full_text());
+        // Waiting for a closing paren means opening a continuation line, which
+        // multiline entry has to be on for.
+        let finished = !self.config.enable_multiline
+            || !self.config.balance_pairs
+            || is_balanced(&state.full_text());
         if !finished {
             self.continue_line(state)?;
             return Ok(Flow::Continue);
@@ -486,32 +509,50 @@ impl Rustline {
 
     // ------------------------------------------------------------- history
 
-    /// Converts a newest-relative history index to a storage slot.
+    /// Converts a history index to a storage slot.
+    ///
+    /// Index 0 is the line being typed, which is not stored in the history at
+    /// all, so it has no slot; index 1 is the newest stored entry.
     fn slot_of(&self, index: usize) -> Option<usize> {
-        self.history.len().checked_sub(1)?.checked_sub(index)
+        if index == 0 {
+            return None;
+        }
+        self.history.len().checked_sub(index)
     }
 
-    /// Converts a storage slot back to a newest-relative index.
+    /// Converts a storage slot back to a history index.
     fn index_of(&self, slot: usize) -> usize {
-        self.history.len().saturating_sub(1).saturating_sub(slot)
+        self.history.len().saturating_sub(slot)
     }
 
-    /// Moves to history entry `index`, counted from the newest.
+    /// The index of the oldest entry, or 0 when nothing is stored.
+    fn oldest_index(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Moves to history entry `index`, where 0 is the line being typed.
     ///
     /// The working buffer is written back into the entry being left, so an edit
     /// to a recalled line survives moving away and coming back.
     fn history_goto(&mut self, state: &mut EditorState, index: usize) {
-        if self.history.len() <= 1 || index > self.history.len() - 1 {
+        if index > self.oldest_index() {
             return;
         }
-        if let Some(slot) = self.slot_of(state.history_index) {
-            self.history.set(slot, state.buffer.as_str());
+        match self.slot_of(state.history_index) {
+            Some(slot) => self.history.set(slot, state.buffer.as_str()),
+            None => {
+                state.scratch.clear();
+                state.scratch.push_str(state.buffer.as_str());
+            }
         }
         state.history_index = index;
-        if let Some(slot) = self.slot_of(index) {
-            if let Some(line) = self.history.get(slot) {
-                state.buffer.set_content(line);
+        match self.slot_of(index) {
+            Some(slot) => {
+                if let Some(line) = self.history.get(slot) {
+                    state.buffer.set_content(line);
+                }
             }
+            None => state.buffer.set_content(&state.scratch),
         }
     }
 
@@ -529,7 +570,7 @@ impl Rustline {
     ///
     /// Returns the key that ended the search, for the caller to re-dispatch.
     fn search(&mut self, state: &mut EditorState, raw: &mut RawMode) -> Result<Option<KeySeq>> {
-        if self.history.len() <= 1 {
+        if self.history.is_empty() {
             return Ok(None);
         }
 
@@ -550,15 +591,19 @@ impl Rustline {
                 break;
             };
 
-            // Where to resume scanning: the entry we are on and how far into it.
-            let mut slot = self.slot_of(state.history_index).unwrap_or(0);
-            let mut limit = state.buffer.cursor();
+            // Where to resume scanning: the entry we are on and how far into
+            // it. On the line being typed there is no match to resume from, so
+            // the whole of the newest entry is eligible.
+            let (mut slot, mut limit) = match self.slot_of(state.history_index) {
+                Some(slot) => (slot, state.buffer.cursor()),
+                None => (self.history.len().saturating_sub(1), usize::MAX),
+            };
             let mut added = 0usize;
 
             match key {
                 KeySeq::Backspace | KeySeq::Ctrl('h') => {
                     needle.pop();
-                    matched = matched.min(needle.len());
+                    matched = matched.min(needle.chars().count());
                 }
                 KeySeq::Ctrl('r') => {
                     // Step past the current match to find an earlier one.
@@ -576,7 +621,7 @@ impl Rustline {
                 }
                 KeySeq::Char(c) => {
                     needle.push(c);
-                    added = c.len_utf8();
+                    added = 1;
                 }
                 other => {
                     terminator = Some(other);
@@ -692,6 +737,76 @@ impl Rustline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Config;
+    use crate::terminal::WinSize;
+
+    /// Builds an editor with `entries` already stored and a session sitting on
+    /// the line being typed.
+    fn session(max_size: usize, entries: &[&str]) -> (Rustline, EditorState) {
+        let mut rl = Rustline::with_config(Config {
+            history_max_size: max_size,
+            ..Config::default()
+        });
+        for entry in entries {
+            rl.add_history_entry(entry);
+        }
+        let state = EditorState::new("> ", "... ", 0, 1, WinSize::default());
+        (rl, state)
+    }
+
+    /// Walking through history and back must return the line being typed, and
+    /// must not consume a history slot to do it.
+    #[test]
+    fn the_line_being_typed_costs_no_history_slot() {
+        let (mut rl, mut state) = session(3, &["a", "b", "c"]);
+        state.buffer.insert("draft");
+
+        for expected in ["c", "b", "a"] {
+            rl.history_move(&mut state, 1);
+            assert_eq!(state.buffer.as_str(), expected);
+        }
+        // The oldest entry is the end of the line.
+        rl.history_move(&mut state, 1);
+        assert_eq!(state.buffer.as_str(), "a");
+
+        for expected in ["b", "c", "draft"] {
+            rl.history_move(&mut state, -1);
+            assert_eq!(state.buffer.as_str(), expected);
+        }
+        // Below the line being typed there is nowhere to go.
+        rl.history_move(&mut state, -1);
+        assert_eq!(state.buffer.as_str(), "draft");
+
+        assert_eq!(rl.history().iter().collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    /// An edit to a recalled entry is kept, as bestline does, and still does
+    /// not disturb the line that was being typed.
+    #[test]
+    fn edits_to_a_recalled_entry_are_written_back() {
+        let (mut rl, mut state) = session(10, &["one", "two"]);
+        state.buffer.insert("typing");
+
+        rl.history_move(&mut state, 1);
+        state.buffer.insert("!");
+        rl.history_move(&mut state, -1);
+        assert_eq!(state.buffer.as_str(), "typing");
+        assert_eq!(rl.history().iter().collect::<Vec<_>>(), ["one", "two!"]);
+    }
+
+    /// With nothing stored, every history key is a no-op rather than a panic.
+    #[test]
+    fn history_keys_on_an_empty_history_do_nothing() {
+        let (mut rl, mut state) = session(10, &[]);
+        state.buffer.insert("draft");
+
+        rl.history_move(&mut state, 1);
+        rl.history_move(&mut state, -1);
+        let oldest = rl.oldest_index();
+        rl.history_goto(&mut state, oldest);
+        assert_eq!(state.buffer.as_str(), "draft");
+        assert!(rl.history().is_empty());
+    }
 
     #[test]
     fn balance_matches_bestline() {
@@ -731,8 +846,14 @@ mod tests {
 
     #[test]
     fn search_prompt_handles_multibyte_needles() {
-        // `matched` is always a character boundary, so slicing is safe.
-        let p = search_prompt(false, "日本", "日".len());
+        // `matched` counts characters, so the split never lands inside one.
+        let p = search_prompt(false, "日本", 1);
         assert!(p.contains("\x1b[4m日\x1b[24m本"));
+    }
+
+    #[test]
+    fn search_prompt_clamps_an_out_of_range_match() {
+        let p = search_prompt(false, "日本", 99);
+        assert!(p.contains("\x1b[4m日本\x1b[24m"));
     }
 }

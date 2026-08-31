@@ -1,6 +1,7 @@
 //! Error type returned by the editor.
 
 use std::io;
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Errors produced while reading a line.
@@ -12,6 +13,10 @@ pub enum RustlineError {
     Io(#[from] io::Error),
 
     /// The terminal could not be configured.
+    ///
+    /// Raised when raw mode cannot be entered or left, which is what happens
+    /// when the descriptor handed to [`crate::Rustline::readline_raw`] turns
+    /// out not to be a terminal after all.
     #[error("terminal error: {0}")]
     Terminal(String),
 
@@ -26,9 +31,19 @@ pub enum RustlineError {
     #[error("end of file")]
     Eof,
 
-    /// A history operation failed.
-    #[error("history error: {0}")]
-    History(String),
+    /// A history file could not be read or written.
+    ///
+    /// Distinct from [`RustlineError::Io`] so that a caller can tell "your
+    /// history file is unreadable", which is usually recoverable, from an I/O
+    /// failure on the terminal itself, which is not.
+    #[error("history file {}: {source}", path.display())]
+    History {
+        /// The file that could not be read or written.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: io::Error,
+    },
 
     /// A system call failed.
     #[error("system error: {0}")]
@@ -53,5 +68,15 @@ mod tests {
     fn messages_are_lowercase_and_terse() {
         assert_eq!(RustlineError::Eof.to_string(), "end of file");
         assert_eq!(RustlineError::Interrupted.to_string(), "interrupted");
+    }
+
+    #[test]
+    fn a_history_error_names_the_file_and_keeps_the_cause() {
+        let err = RustlineError::History {
+            path: PathBuf::from("/tmp/.demo_history"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        assert!(err.to_string().contains("/tmp/.demo_history"));
+        assert!(std::error::Error::source(&err).is_some());
     }
 }
