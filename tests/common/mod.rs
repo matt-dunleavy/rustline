@@ -17,6 +17,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+/// `TIOCSCTTY` is a `c_ulong` on Linux but a `c_uint` on the BSDs, while
+/// `ioctl` takes a `c_ulong` on both. The cast is a widening on one platform
+/// and a no-op on the other, which is why the lint is silenced here rather
+/// than the cast removed.
+#[allow(clippy::unnecessary_cast)]
+const TIOCSCTTY: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
+
 /// Locates a built example binary, building the examples first.
 ///
 /// Test binaries live in `<target>/<profile>/deps`, so the example binaries sit
@@ -109,7 +116,7 @@ impl Pty {
         unsafe {
             command.pre_exec(|| {
                 nix::unistd::setsid().map_err(std::io::Error::from)?;
-                if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::ioctl(0, TIOCSCTTY, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

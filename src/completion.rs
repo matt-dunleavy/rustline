@@ -153,12 +153,13 @@ fn split_path_word(word: &str) -> (&str, &str) {
 /// Expands a leading `~` or `~/` to the user's home directory.
 fn expand_tilde(dir: &str) -> Option<PathBuf> {
     let rest = dir.strip_prefix('~')?;
-    // Only `~` and `~/...` are handled; `~user` needs passwd lookups we do not
-    // want to take a dependency on.
+    // Only `~` and `~/...` are handled. `~user` would need a lookup by name and
+    // a rule for what to do when there is no such user; bestline does not
+    // expand it either.
     if !rest.is_empty() && !rest.starts_with('/') {
         return None;
     }
-    let home = dirs::home_dir()?;
+    let home = crate::home_dir()?;
     Some(home.join(rest.trim_start_matches('/')))
 }
 

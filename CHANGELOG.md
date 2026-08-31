@@ -24,5 +24,12 @@ editing over ANSI X3.64 escape sequences, and no terminfo dependency.
   `HintProvider`.
 - `set_xlat`, for input methods that map one keyboard onto another script.
 
+### Dependencies
+
+- `nix`, `unicode-width` and `thiserror` only. `home_dir` is resolved from
+  `$HOME` with a passwd fallback rather than through `dirs`, which reached an
+  MPL-2.0 crate (`option-ext`) via `dirs-sys` and put an MPL entry in the
+  licence audit of every crate depending on rustline.
+
 [Unreleased]: https://github.com/matt-dunleavy/rustline/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/matt-dunleavy/rustline/releases/tag/v0.1.0

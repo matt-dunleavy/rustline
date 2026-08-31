@@ -405,6 +405,25 @@ pub fn readline(prompt: &str) -> Result<String> {
     Rustline::new().readline(prompt)
 }
 
+/// The current user's home directory.
+///
+/// `$HOME` when it is set and non-empty, falling back to the passwd entry that
+/// a login shell would have taken `$HOME` from in the first place.
+///
+/// This is deliberately not the `dirs` crate. Its only use here was this one
+/// function, and it reached it through `dirs-sys` and the MPL-2.0 `option-ext`,
+/// which put an MPL entry into the licence audit of every crate that depends on
+/// rustline. `nix` is already a dependency and answers the same question.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
+        _ => nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .ok()
+            .flatten()
+            .map(|user| user.dir),
+    }
+}
+
 /// Derives the conventional history path for a program name.
 ///
 /// A `prog` containing `/` or `.` is taken to be the path itself; otherwise the
@@ -415,7 +434,7 @@ pub fn history_path(prog: &str) -> PathBuf {
         return PathBuf::from(prog);
     }
     let name = format!(".{prog}_history");
-    match dirs::home_dir() {
+    match home_dir() {
         Some(home) => home.join(name),
         None => PathBuf::from(name),
     }
@@ -493,6 +512,17 @@ mod tests {
         let mut other = Rustline::new();
         other.load_history(&path).unwrap();
         assert_eq!(other.history().iter().collect::<Vec<_>>(), ["one", "two"]);
+    }
+
+    #[test]
+    fn home_dir_resolves_to_an_absolute_path() {
+        // Deliberately no `set_var` here: mutating the environment races every
+        // other thread that reads it, which is why `is_unsupported_term_name`
+        // was split out. Whatever the environment holds, the answer must be
+        // absolute, because it gets a file name joined onto it.
+        if let Some(home) = home_dir() {
+            assert!(home.is_absolute(), "home_dir returned {home:?}");
+        }
     }
 
     #[test]

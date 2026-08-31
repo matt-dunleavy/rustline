@@ -26,10 +26,9 @@ include = [
 ]
 
 [dependencies]
-nix = { version = "0.30.1", features = ["term", "signal", "poll", "fs", "process"] }
+nix = { version = "0.30.1", features = ["term", "signal", "poll", "fs", "process", "user"] }
 unicode-width = "0.2.1"
 thiserror = "2.0.12"
-dirs = "6.0"
 
 [dev-dependencies]
 proptest = "1"
