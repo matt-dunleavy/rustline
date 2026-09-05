@@ -4,8 +4,8 @@
 [![docs.rs](https://img.shields.io/docsrs/rustline)](https://docs.rs/rustline)
 [![ci](https://github.com/matt-dunleavy/rustline/actions/workflows/ci.yml/badge.svg)](https://github.com/matt-dunleavy/rustline/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/rustline.svg)](LICENSE)
-[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=Follow%20%40matthewdunleavy)](https://twitter.com/matthewdunleavy)
 [![Discord](https://img.shields.io/badge/discord-chat-green?logo=discord)](https://discord.gg/dFXhpQcQ7u)
+[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/cloudposse.svg?style=social&label=Follow%20%40matthewdunleavy)](https://twitter.com/matthewdunleavy)
 
 Rustline is a Unix line-editing library for Rust, ported from [bestline](https://github.com/jart/bestline), itself a fork of [linenoise](https://github.com/antirez/linenoise). It provides interactive, editable input for REPLs, shells, and other terminal applications through a small API centered on the `Rustline` type.
 
